@@ -1,0 +1,2122 @@
+rm(list = ls())
+gc()
+gc()
+
+library(rtracklayer)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(tidyr)
+library(DESeq2)
+library(data.table)
+library(qsmooth)
+source('/Users/Hidde/delaat/group/hidde/peakHiC/R/peakHiC_functions.R')
+setwd('/Users/Hidde/delaat/group/hidde/R/')
+
+plotV4Cdata <- function(vpID, genomeObj, bigwigs, vpZoom = 0, genesGR, plot_genes = F, loops, recipPlot = F, saveFig){
+  ###########################################################################################################
+  ####This function gathers the V4C data such as bigwigs, and coverage from a
+  ####certain window of the vpID##### this data is then passed to the makePlots function
+  ###########################################################################################################
+    if(recipPlot){
+      #plot the coverage from the two reciprocal viewpoints
+        vpID2 <- getAnchorVP(recipLoops = loops, vpID)
+        makeRecipPlot(vpID, vpID2, genomeObj, genesGR, loops = loops, vpZoom, saveFig)
+    }else{
+        #plot with one VP, makes a list which contains the bigwig data and V4C data for each position
+        plotList <- list()
+        plotList[['V4C']] <- getV4CData(vpID, genomeObj = genomeObj, vpZoom = vpZoom)
+        underlimit <- min(plotList$V4C$position) #set ranges of the plot
+        upperlimit <- max(plotList$V4C$position)
+
+        vpsGR <- genomeObj$vpsGR
+        chr <- as.vector(seqnames(vpsGR[match(vpID,genomeObj$vpsGR$vpID)])[1])
+        bwsel <- BigWigSelection(ranges = GRanges(seqnames = chr , IRanges(underlimit,  upperlimit)))
+
+        for(expType in names(bigwigs)){
+          #Go through the bigwigs, and use the import function from rTrackLayer to import selection of the bigwig file
+            bwDat <- data.frame(type = character(),
+                                position = integer(),
+                                value = numeric())
+            for(track in bw_list[[expType]]){
+                bwImport <- as.data.frame(import(con = track, selection = bwsel))
+                type <- strsplit(track, '_')[[1]]
+
+                if(sum(grepl('control|tumor', type) == 1)){
+                    type <- type[grep('control|tumor', type)]
+
+                }else{
+                    type <- 'encode'
+                }
+
+                bwImportDF <- data.frame(type = type,
+                                         position = bwImport$start,
+                                         value = bwImport$score)
+
+                bwDat <- rbind(bwDat, bwImportDF)
+            }
+
+            plotList[[expType]] <- bwDat
+
+        }
+        makePlots(plotDat = plotList, genomeObj = genomeObj, vpID = vpID, genesGR = genesGR, underlimit = underlimit, upperlimit = upperlimit, plot_genes = plot_genes, loops = loops, saveFig)
+    }
+}
+
+getV4CData <- function(vpID ,genomeObj ,configOpt=NULL,wSize=21,alphaFDR=0.1,qWr=2.0,minDist=20e3,storeVPReads=FALSE, vpZoom){
+  ###########################################################################################################
+  ####This function gathers the V4C data from the .rds files of each viewpoint
+  ####containing the coverage of this viewpoint for each sample the mean is
+  ####taken of the coverage of each sample and returned as a dataframe of the
+  ####mean coverage between the ranges of the control and tumor samples
+  ###########################################################################################################
+
+    if(is.null(configOpt)) {
+        configOpt <- genomeObj$configOpt
+    }
+
+    rdsFldr <- paste0(configOpt$projectFolder,"rds/")
+    fragsFile <- configOpt$fragsFile
+    hicCond <- configOpt$hicCond
+
+    vpsGR <- genomeObj[["vpsGR"]]
+    partID <- vpsGR$partID[match(vpID,vpsGR$vpID)]
+    vpPos <- start(vpsGR[match(vpID,vpsGR$vpID)])
+    vpChr <- as.vector(seqnames(vpsGR[match(vpID,vpsGR$vpID)]))[1]
+
+    vpUpperLimit <- vpPos + vpZoom
+    vpUnderLimit <- vpPos - vpZoom
+
+    fRDS <- paste0(rdsFldr,"vpReads_",partID,".rds")
+
+    if(file.exists(fRDS)) {
+
+        vpReads <- readRDS(fRDS)
+
+    } else {
+
+        frags <- readRDS(fragsFile)[[vpChr]]
+        vpReads <- getPeakHiCData(partID=partID,frags=frags,genomeObj=genomeObj)
+
+        if(storeVPReads) {
+            saveRDS(vpReads,file=fRDS)
+        }
+    }
+
+    nextVPReads <- vpReads[[vpID]][[hicCond]]
+
+    num.exp <- length(nextVPReads)
+
+    db <- data.frame(pos=nextVPReads[[1]]$GR$pos,stringsAsFactors=FALSE)
+    tracks <- names(nextVPReads)
+
+    for(i in 1:length(tracks)) {
+        db[[tracks[i]]] <- nextVPReads[[i]]$GR$normV4C
+    }
+
+    db <- db[vpUnderLimit < db$pos & db$pos < vpUpperLimit, ]
+    tracks_control <- c('S1_pairix_noheader', 'S2_pairix_noheader', 'S9_pairix_noheader')
+    tracks_myc <- c('S3_pairix_noheader', 'S4_pairix_noheader', 'S17_pairix_noheader')
+    db[["V4C_control"]] <- apply(db[,tracks_control],1,mean)
+    db[["V4C_tumor"]] <- apply(db[,tracks_myc],1,mean)
+    db[["V4C_union"]] <- apply(db[, c(tracks_control, tracks_myc)],1,mean)
+    df_control <- data.frame(type = 'control',
+                             position = db$pos,
+                             value = db$V4C_control)
+    df_tumor <- data.frame(type = 'tumor',
+                           position = db$pos,
+                           value = db$V4C_tumor)
+    # df <- data.frame(type = 'union',
+    #                        position = db$pos,
+    #                        value = db$V4C_union)
+    df <- rbind(df_control, df_tumor)
+    df$type <- as.factor(df$type)
+    return(df)
+}
+
+genesRanges <- function(genesGR){
+  #######################################################################################################################################
+  # for each gene in the genomic ranges Object genesGR, get the range of the gene and add that to the ranges dataframe
+  #######################################################################################################################################
+    ranges <- data.frame(experiment = character(),
+                         position = integer(),
+                         geneSymbol = factor(),
+                         strand = character())
+    for(row in 1:length(ranges(genesGR))){
+        geneRange <- data.frame(experiment = 'genes',
+                                position = start(genesGR)[row]:end(genesGR)[row],
+                                geneSymbol = names(genesGR)[row],
+                                strand = genesGR$ori[row])
+        ranges <-  rbind(ranges, geneRange)
+    }
+    return(ranges)
+}
+
+makeRecipPlot <- function(vpID1, vpID2, genomeObj, genesGR, loops, vpZoom, saveFig){
+  ############################################################################################################
+  ####this function plots 2 V4C profiles against each other to check for reciprocallity
+  ############################################################################################################
+  plotDat <- list()
+
+  anchor1 <- loops$maxV4CscorePos[loops$id == vpID1]
+  anchor2 <- loops$maxV4CscorePos[loops$id == vpID2]
+  hook1 <- loops$vp_X1[loops$id == vpID1]   #vp
+  hook2 <- loops$vp_X1[loops$id == vpID2]
+
+  # if(abs(anchor1[1] - anchor2[1]) > vpZoom/4){
+  #   vpZoom <- 2*(abs(anchor1[1] - anchor2[1]))
+  # }
+
+  plotDat[['V4Cdat1']] <- getV4CData(vpID = vpID1, genomeObj = genomeObj, vpZoom = vpZoom)
+  plotDat[['V4Cdat2']] <- getV4CData(vpID = vpID2, genomeObj = genomeObj, vpZoom = vpZoom)
+
+  underlimit <- max(c(min(plotDat$V4Cdat2$position), min(plotDat$V4Cdat1$position)))/1e6
+  upperlimit <- min(c(max(plotDat$V4Cdat1$position), max(plotDat$V4Cdat2$position))) /1e6
+
+  if(saveFig){
+    png(paste0('/Users/Hidde/delaat/group/hidde/MODHEP/plots/V4C/recipPlots/',vpID1, '_V4C.png'))
+  }
+
+  par(mfrow = c(2,1))
+  par(mar = c(2,2,0.5,1))
+
+  palette(c('red', 'blue', 'green'))
+  palette(adjustcolor(palette(), alpha.f = 0.1))
+
+  plot(plotDat$V4Cdat1$position/1e6, plotDat$V4Cdat1$value,
+       xlim = c(underlimit,upperlimit), ylim = c(0,20),
+       type = 'h', col = plotDat$V4Cdat1$type,
+       xlab = "position", ylab = "value")
+  abline(v = c(hook1, hook2)/1e6)
+
+  plot(plotDat$V4Cdat2$position/1e6, plotDat$V4Cdat2$value,
+       xlim = c(underlimit,upperlimit), ylim = c(0,20),
+       type = 'h', col = plotDat$V4Cdat2$type,
+       xlab = "position", ylab = "value")
+  abline(v = c(hook1, hook2)/1e6)
+
+  if(saveFig){
+    dev.off()
+  }
+}
+
+makePlots <- function(plotDat, genomeObj, vpID, genesGR, underlimit, upperlimit, plot_genes = F, loops, saveFig){
+  ####################################################################################################################
+  ########final function to produce the plots from the list passed on by makeV4Cplots function and save it.
+  ########red is control, blue is tumor.
+  ####################################################################################################################
+    anchor <- loops$maxV4CscorePos[loops$id == vpID]
+    plotList <- list()
+    nPlots <- length(plotDat)
+
+    if(saveFig){
+        png(paste0("/Users/Hidde/delaat/group/hidde/MODHEP/plots/V4C/", vpID, 'V4C_CHiPseq.png'))
+    }
+
+    par(mfrow = c(nPlots,1))
+    par(mar = c(2,2,0.5,1))
+    layout(mat = matrix(c(1,1,2,3,4), nrow = 5, ncol = 1))
+
+    for(plotName in names(plotDat)){
+
+        plot <- plotDat[[plotName]]
+
+        if(plotName == 'V4C'){
+
+            palette(c('red', 'blue'))
+            palette(adjustcolor(palette(), alpha.f = 0.1))
+            plot(plot$position/1e6, plot$value,
+                 xlim = c(underlimit,upperlimit)/1e6, ylim = c(0,20),
+                 type = 'h', col = plot$type,
+                 xlab = "position", ylab = "value")
+            abline(v = c(anchor)/1e6)
+
+            if( plot_genes ){
+
+                addGenes(genesGR = genesGR, vpID = vpID, genomeObj = genomeObj)}
+
+        }else{
+
+            palette(c('red', 'blue'))
+            palette(adjustcolor(palette(), alpha.f = 0.1))
+            plot(plot$position/1e6, plot$value,
+                 xlim = c(underlimit,upperlimit)/1e6, ylim = c(0,10),
+                 type = 'h', col = plot$type,
+                 xlab = "position", ylab = "value")
+        }
+    }
+    if(saveFig){
+        dev.off()
+    }
+}
+
+# removeOverlappingLoops <- function(recipLoops, overlapWindow){
+#     ####function was designed to remove overlapping loops to see how many 'true biologival' loops there were in the dataset.
+#
+#
+#     lVP <- floor((recipLoops$vp_X1 + recipLoops$vp_X2)/2)
+#     lAnchor <- recipLoops$maxV4CscorePos
+#
+#     plot(x = 1:nrow(recipLoops), y = recipLoops$vp_X1/overlapWindow, ylim = c(min(recipLoops$vp_X1)/overlapWindow, max(recipLoops$maxV4CscorePos)/overlapWindow))
+#     points(x = 1:nrow(recipLoops), y = recipLoops$maxV4CscorePos/overlapWindow, col = 'red')
+#
+#     xPos <- pmin(lVP,lAnchor)
+#     yPos <- pmax(lVP,lAnchor)
+#     lChr <- recipLoops$chr
+#
+#     lx <- resize(GRanges(lChr,IRanges(xPos,xPos), loopID = recipLoops$loopID), width=overlapWindow, fix="center")
+#     ly <- resize(GRanges(lChr,IRanges(yPos,yPos), loopID = recipLoops$loopID), width=overlapWindow, fix="center")
+#
+#
+#     VPovl <- as.data.frame(makeOvlMat(lx))      #of the start position seek the loops with the same start position within the window, also find with the same end position, if one index has both same start and end remove.
+#     AnchorOvl <- as.data.frame(makeOvlMat(ly))
+#
+#     redundant <- data.frame('loop'= c(1:nrow(recipLoops)), 'redundancy' = rep(F, nrow(recipLoops)))
+#     redundantLoops <- match_df(VPovl, AnchorOvl)
+#
+#     for(i in 1:nrow(recipLoops)){
+#         if(!redundant$redundancy[i]){
+#             remove <- redundantLoops$V2[redundantLoops$V1 %in% redundant$loop[!redundant$redundancy]]
+#             print(remove)
+#             redundant$redundancy[remove] <- T
+#         }
+#
+#     }
+#
+#     nonRedundantLoops <- recipLoops[!redundant$redundancy,]
+#     return(nonRedundantLoops)
+# }
+
+makeOvlMat <- function(l){
+  ######################################################
+  #write a matrix of the overlapping loops, with same anchor and same viewpoint site within range
+  ######################################################
+    ovl <- findOverlaps(l)
+    ovl <- ovl[!ovl@from == ovl@to]
+
+    xOvl <- pmin(ovl@from, ovl@to)
+    yOvl <- pmax(ovl@from, ovl@to)
+
+    ovl <- matrix(c(xOvl,yOvl), ncol = 2)
+    ovl <- ovl[!duplicated(ovl),]
+    return(ovl)
+}
+
+writeHICCUPs2D <- function(lx, ly, outFile, clr=NULL, width=NULL) {
+  ############################################################################################################
+  #write a file that can be read by the Juicer tool with genomic ranges in it.
+  ############################################################################################################
+    lx <- GRanges(seqnames = chr, IRanges(start = pos1,))
+    labs <- c("chr1","x1","x2","chr2","y1","y2","color")
+
+    if(!is.null(width)) {
+
+        lx <- resize(lx,width=width,fix="center")
+        ly <- resize(ly,width=width,fix="center")
+
+    }
+
+    out <- cbind(as.data.frame(lx)[,1:3],as.data.frame(ly)[,1:3])
+
+    if(is.null(clr)) {
+
+        out$color <- rep("255,0,255",nrow(out))
+
+    } else {
+
+        out$color <- rep(clr,nrow(out))
+
+    }
+
+    colnames(out) <- labs
+
+    write.table(out,file=outFile,sep="\t",row.names=F,quote=F)
+    return(out)
+}
+
+getAnchorVP <- function(recipLoops, vpID1){
+  ################################################################
+  ############get the vpID of the anchor###############
+  ########################### ################################
+    anchor <- recipLoops$maxV4CscorePos[recipLoops$id == vpID1]
+    chr <- recipLoops$chr[recipLoops$id == vpID1]
+    targetChr <- recipLoops[recipLoops$chr == chr, ]
+    vpID2 <- as.character(recipLoops$id[which.min(abs(recipLoops$vp_X1-anchor))])
+    return(vpID2)
+}
+
+categoriseLoops <- function(reciprocalLoops, genomeObj, removeOverlapping = T){
+  ################################################################
+  ############make a list of each viewpoint type and its corresponding loops###############
+  ########################### ################################
+    vpGRs <- genomeObj$vpsGR
+    loopCategories <- list()
+    for(type in unique(vpGRs$type)){
+
+        vpIDs <- vpGRs$vpID[vpGRs$type == type]
+        loopCategories[[type]] <- reciprocalLoops[reciprocalLoops$id%in%vpIDs,]
+
+        if(removeOverlapping){
+
+            loopCategories[[type]] <- removeOverlappingLoops(loopCategories[[type]], overlapWindow = 10000)
+
+        }
+    }
+    return(loopCategories)
+}
+
+# addGenes <- function(genesGR,vpID,genomeObj,xdiv=1e6,ylim=NULL,xlim=NULL) {
+#
+#     if( is.null( ylim ) ) {
+#
+#         ylim <- par("usr")[3:4]
+#
+#     }
+#
+#     if( is.null( xlim ) ) {
+#
+#         xlim <- par("usr")[1:2]
+#
+#     }
+#
+#     vpsGR <- genomeObj[["vpsGR"]]
+#     vpChr <- as.vector(seqnames(vpsGR[match(vpID,vpsGR$vpID)])[1])
+#     plotGR <- GRanges(vpChr,IRanges(floor(xlim[1]*xdiv),ceiling(xlim[2]*xdiv)))
+#
+#     genesGR <- genesGR[unique(findOverlaps(genesGR,plotGR)@from)]
+#     chr <- vpChr
+#
+#     if( !is.null( genesGR ) ) {
+#
+#         minPos <- min( ranges( genesGR )@start )
+#         maxPos <- max( ranges( genesGR )@start + ranges( genesGR )@width - 1 )
+#         genesStart <- genesGR[ which( ranges( genesGR )@start >= minPos & ranges(genesGR)@start <= maxPos ), ]$symbol
+#         genesEnd <- genesGR [ which( ( ranges(genesGR)@start + ranges(genesGR)@width - 1 ) >= minPos & ( ranges(genesGR)@start + ranges(genesGR)@width - 1 ) <= maxPos ), ]$symbol
+#         genesWhole <- genesGR[ which( ranges( genesGR )@start < minPos & ( ranges( genesGR )@start + ranges( genesGR )@width - 1 )  > maxPos ), ]$symbol
+#         genesInRange <- unique( c( genesStart, genesEnd, genesWhole ) )
+#         genesGR <- genesGR[ which( genesGR$symbol %in% genesInRange ), ]
+#         genesGR <- genesGR[ which( genesGR@seqnames == chr ), ]
+#         names(genesGR) <- genesGR$symbol
+#         plusGenes <- genesGR[ which ( as.data.frame( genesGR )$ori == '+' ), ]
+#         minusGenes <- genesGR[ which ( as.data.frame( genesGR )$ori == '-' ), ]
+#         # then we divide them in +/- genes
+#
+#         plusGenes <- genesGR[ which ( as.data.frame( genesGR )$ori == '+' ), ]
+#         minusGenes <- genesGR[ which ( as.data.frame( genesGR )$ori == '-' ), ]
+#
+#         if ( length( plusGenes ) != 0 ) {
+#             posX1genes <- ranges( plusGenes )@start
+#             posX2genes <- ranges( plusGenes )@start + ranges( plusGenes )@width - 1
+#             posX1genes[ which( posX1genes < minPos ) ] <- minPos
+#             posX2genes[ which( posX2genes > maxPos ) ] <- maxPos
+#             genesCenter <- ( posX1genes + posX2genes ) / 2
+#             plotRegions( ranges=plusGenes, yrange = c( 2*ylim[1]/8, ylim[1]/8 ), col="red" , xdiv=xdiv)
+#             text( x=genesCenter/xdiv, y=3*ylim[1]/8, labels=plusGenes$geneName, cex=0.5 )
+#         }
+#         if ( length( minusGenes ) != 0 ) {
+#             posX1genes <- ranges( minusGenes )@start
+#             posX2genes <- ranges( minusGenes )@start + ranges( minusGenes )@width - 1
+#             posX1genes[ which( posX1genes < minPos ) ] <- minPos
+#             posX2genes[ which( posX2genes > maxPos ) ] <- maxPos
+#             genesCenter <- ( posX1genes + posX2genes ) / 2
+#             plotRegions( ranges=minusGenes, yrange = c( 6*ylim[1]/8, 5*ylim[1]/8 ), col="darkblue" , xdiv=xdiv )
+#             text( x=genesCenter/xdiv, y=7*ylim[1]/8, labels=minusGenes$geneName, cex=0.5 )
+#         }
+#     }
+#
+# }
+
+# plotRegions <- function( ranges, yrange, xdiv=1e6, plotRanges=NULL, col="black" ) {
+#
+#     if(is.null(plotRanges)) {
+#
+#     } else {
+#
+#         ovlIdx <- findOverlaps(ranges,plotRanges)@queryHits
+#         ranges <- ranges[ovlIdx]
+#
+#     }
+#
+#     if(length(ranges)){
+#         rect( xleft=start(ranges)/1e6, ybottom=abs(yrange[1]*20), xright=end(ranges)/1e6, ytop=abs(yrange[2]*20), col=col, border=FALSE )
+#
+#     }
+#
+# }
+
+# makeDoughnuts <- function(loops, genomeObj, anchorSize = 10e3,loopTypes = c('CTCF','H3K27Ac_chipseq', 'Myc_binding', 'enhancer', 'promoter'), saveFig = F){
+#     loopsType <- categoriseLoops(loops, genomeObj, removeOverlapping = F)
+#     loopsGR <- GRanges(seqnames = loops$chr, ranges = IRanges(loops$anchor_X1, loops$anchor_X2), loopid = loops$id)
+#     vpsGR <- genomeObj$vpsGR
+#     loopPropotions <- list()
+#
+#     for(type in loopTypes){
+#
+#         loopedVPs <- sum(countOverlaps(vpsGR[vpsGR$type == type], loopsGR) > 0)
+#         totalVPs <- sum(vpsGR$type == type)
+#         loopPropotions[[type]] <- data.frame(totalVPs = totalVPs,
+#                                              loopVPs = loopedVPs,
+#                                              percentage = loopedVPs/totalVPs,
+#                                              notLooped = totalVPs - loopedVPs)
+#     }
+#
+#     if(saveFig){
+#
+#         png('/Users/Hidde/delaat/group/hidde/MODHEP/plots/fig1/doughnuts.png')
+#
+#     }
+#
+#     par(mfrow = c(2, ceiling(length(loopPropotions)/2)))
+#     for(type in names(loopPropotions)){
+#
+#         loops <- loopPropotions[[type]]
+#         doughnut(x = c(loops$loopVPs, loops$notLooped), labels = c(loops$loopVPs, loops$notLooped), main = type, col = c('lightblue', 'grey'), outer.radius = 1)
+#
+#     }
+#
+#     if(saveFig){
+#         dev.off()
+#     }
+# }
+
+
+# doughnut <- function (x, labels = names(x), edges = 200, outer.radius = 0.8,
+#                       inner.radius=0.6, clockwise = FALSE,
+#                       init.angle = if (clockwise) 90 else 0, density = NULL,
+#                       angle = 45, col = NULL, border = FALSE, lty = NULL,
+#                       main = NULL, ...){
+#     if (!is.numeric(x) || any(is.na(x) | x < 0))
+#         stop("'x' values must be positive.")
+#     if (is.null(labels))
+#         labels <- as.character(seq_along(x))
+#     else labels <- as.graphicsAnnot(labels)
+#     x <- c(0, cumsum(x)/sum(x))
+#     dx <- diff(x)
+#     nx <- length(dx)
+#     plot.new()
+#     pin <- par("pin")
+#     xlim <- ylim <- c(-1, 1)
+#     if (pin[1L] > pin[2L])
+#         xlim <- (pin[1L]/pin[2L]) * xlim
+#     else ylim <- (pin[2L]/pin[1L]) * ylim
+#     plot.window(xlim, ylim, "", asp = 1)
+#     if (is.null(col))
+#         col <- if (is.null(density))
+#             palette()
+#     else par("fg")
+#     col <- rep(col, length.out = nx)
+#     border <- rep(border, length.out = nx)
+#     lty <- rep(lty, length.out = nx)
+#     angle <- rep(angle, length.out = nx)
+#     density <- rep(density, length.out = nx)
+#     twopi <- if (clockwise)
+#         -2 * pi
+#     else 2 * pi
+#     t2xy <- function(t, radius) {
+#         t2p <- twopi * t + init.angle * pi/180
+#         list(x = radius * cos(t2p),
+#              y = radius * sin(t2p))
+#     }
+#     for (i in 1L:nx) {
+#         n <- max(2, floor(edges * dx[i]))
+#         P <- t2xy(seq.int(x[i], x[i + 1], length.out = n),
+#                   outer.radius)
+#         polygon(c(P$x, 0), c(P$y, 0), density = density[i],
+#                 angle = angle[i], border = border[i],
+#                 col = col[i], lty = lty[i])
+#         Pout <- t2xy(mean(x[i + 0:1]), outer.radius)
+#         lab <- as.character(labels[i])
+#         if (!is.na(lab) && nzchar(lab)) {
+#             lines(c(1, 1.05) * Pout$x, c(1, 1.05) * Pout$y)
+#             text(1.1 * Pout$x, 1.1 * Pout$y, labels[i],
+#                  xpd = TRUE, adj = ifelse(Pout$x < 0, 1, 0),
+#                  ...)
+#         }
+#         ## Add white disc
+#         Pin <- t2xy(seq.int(0, 1, length.out = n*nx),
+#                     inner.radius)
+#         polygon(Pin$x, Pin$y, density = density[i],
+#                 angle = angle[i], border = border[i],
+#                 col = "white", lty = lty[i])
+#     }
+#
+#     title(main = main, ...)
+#     invisible(NULL)
+# }
+
+# countloopInteractions <- function(loopsType, genomeObj, anchorSize = 10e3, interactor = 'promoter', anchor = 'promoter', removeZero = T, removeDuplicates = F, anchorGR = NULL){
+#   ################################################################
+#   ############counts the loops between a user given anchor and VP type. analyze which are predominant##############
+#   ########################### ################################
+#     if(is.null(anchorGR)){
+#
+#         vpsGRanchor <- genomeObj$vpsGR[genomeObj$vpsGR$type == anchor]
+#
+#     }else{
+#
+#         vpsGRanchor <- anchorGR
+#
+#     }
+#
+#     loopInteractions <- loopsType
+#
+#     loopsAnchorSite <- GRanges(seqnames= loopInteractions$chr,
+#                                IRanges(start = loopInteractions$anchor_X1 , end = loopInteractions$anchor_X2),
+#                                loopID = loopInteractions$loopID,
+#                                vpID = loopInteractions$id)
+#
+#     loopInteractions$interactionCounts <- countOverlaps(loopsAnchorSite, vpsGRanchor)
+#
+#     if(removeZero){
+#
+#         loopInteractions <- loopInteractions[loopInteractions$interactionCounts > 0,]
+#
+#     }
+#     if(removeDuplicates){
+#
+#         loopInteractions <- loopInteractions[!duplicated(loopInteractions$id),]
+#
+#     }
+#
+#     return(loopInteractions)
+# }
+
+getSymbols <- function(df, genomeObj){
+    vpsGR <- genomeObj$vpsGR
+    names <- vpsGR$name[match(df$id,vpsGR$vpID)]
+    symbol <- promNames$gene[match(names,promNames$name)]
+    return(symbol)
+}
+
+getRNAexpression <- function(loopDF, expressionDat, genomeObj){
+    if(startsWith(loopDF$id[1], 'NM')){
+
+        loopDF$symbol <- genomeObj$vpsGR$name[match(loopDF$id, genomeObj$vpsGR$vpID)]
+
+    }
+
+    if(is.null(loopDF$symbol)){
+
+        loopDF$symbol <- try(getSymbols(loopDF, genomeObj))
+
+    }
+
+    loopDF$controlExp <- expressionDat$Kress_C_avg[match(loopDF$symbol, expressionDat$gene_id)]
+    loopDF$tumorExp <- expressionDat$Kress_Twt_avg[match(loopDF$symbol, expressionDat$gene_id)]
+    # loopDF$log2FC <- expressionDat$TvsC_log2FC[match(loopDF$symbol, expressionDat$gene_id)]
+    #this one is not completely correct therefor calculate it manually
+    loopDF$log2FC <- apply(loopDF, 1, function(x){log2(as.numeric(x[['tumorExp']])) - log2(as.numeric(x[['controlExp']]))})
+    loopDF$log2FC[is.infinite(loopDF$log2FC)] <- 0
+    return(loopDF)
+}
+
+# plotLoopInteractionExpression <- function(loopsType, genomeObj, expressiondat, anchorSize = 10e3, interactor = 'promoter', anchor){
+#   ################################################################
+#   ############From a certain viewpoint type plot all the loops containing a user defined interaction ###############
+#   ########################### ################################
+#     loopInteractions <- countloopInteractions(loopsType, genomeObj, anchor = anchor,removeZero = F) %>%
+#         getRNAexpression(expressiondat, genomeObj) #%>%
+#         #unique(id)
+#     loopInteractions$interactionCounts[loopInteractions$interactionCounts > 3] <- 3
+#
+#     par(mfrow = c(1,2))
+#     boxplot(controlExp ~ interactionCounts, data = loopInteractions[loopInteractions$control, ], ylim = c(0,250))
+#     boxplot(tumorExp ~ interactionCounts, data = loopInteractions[loopInteractions$tumor, ], ylim = c(0,250))
+#     return(loopInteractions)
+# }
+
+# plotISExpression <- function(loopsCovTypes, genomeObj, expressionDat, tumor = c('S3', 'S4', 'S17'), control = c('S1', 'S2', 'S9'),
+#                              anchorSize = 10e3, interactor = 'promoter', anchor = 'enhancer'){
+#     loopIntCounts <- countloopInteractions(loopsType = loopsCovTypes[[interactor]], genomeObj = genomeObj, anchorSize = 10e3, interactor = interactor, anchor = anchor, removeZero = T, removeDuplicates = F) %>%
+#         getInteractionScore(control = control, tumor = tumor, expressionDat =  expressionDat, sumVPs = T) %>%
+#         getRNAexpression(expressionDat, genomeObj) %>%
+#         na.omit()
+#
+#     plotIsExpressionHeatMap(loopISexp)
+#     return(loopISexp)
+# }
+
+# plotIsExpressionHeatMap <- function(df, IScutOff = 100, expCutOff = 100){
+#     rbPal <- colorRampPalette(c('red','blue'))
+#     controlPlot <- data.frame(exp = df$controlExp, IS = df$controlIS) %>% arrange(IS) %>% filter(IS < IScutOff, exp < expCutOff)
+#     tumorPlot <- data.frame(exp = df$tumorExp, IS = df$tumorIS) %>% arrange(IS) %>% filter(IS < IScutOff, exp < expCutOff)
+#
+#     controlPlot$col <- rbPal(100)[as.numeric(cut(controlPlot$exp, breaks = 100))]
+#     tumorPlot$col <- rbPal(100)[as.numeric(cut(tumorPlot$exp, breaks = 100))]
+#
+#     par(mfrow = c(4,1))
+#     par(mar = c(0,1,0.5,1))
+#     layout(mat = matrix(c(1,2,2,3,4,4), nrow = 6, ncol = 1))
+#     plot(x = row.names(controlPlot), y = controlPlot$IS, col = 'black', type = 'h',  xaxt='n', ann=FALSE, yaxt='n')
+#     plot(x = row.names(controlPlot), y = rep(1, nrow(controlPlot)), col = as.character(controlPlot$col), type = 'h', ylim = c(0,1),  xaxt='n', ann=FALSE, yaxt='n')
+#     plot(x = row.names(tumorPlot), y = tumorPlot$IS, col = 'black', type = 'h',  xaxt='n', ann=FALSE, yaxt='n')
+#     plot(x = row.names(tumorPlot), y = rep(1, nrow(tumorPlot)), col = as.character(tumorPlot$col), type = 'h', ylim = c(0,1),  xaxt='n', ann=FALSE, yaxt='n')
+#
+# }
+
+getInteractionScore <- function(loopIntCounts, control = c('S1', 'S2', 'S9'), tumor = c('S3', 'S4', 'S17'), expressionDat, sumVPs = F){
+  ##########################################################################################################################################################
+  ############This function sum up the individuall coverage (can be normalized) to get the interaction strength, and computes the CovQDdiff###############
+  ########################### ##########################################################################################################################
+    controlIS <- loopIntCounts[,'S1'] + loopIntCounts[,'S2'] + loopIntCounts[,'S9']
+    tumorIS <- loopIntCounts[,'S3'] + loopIntCounts[,'S4'] + loopIntCounts[,'S17']
+    loopIntCounts$controlIS <- controlIS
+    loopIntCounts$tumorIS <- tumorIS
+
+    if(sumVPs){
+        controlIS <- aggregate(controlIS~id,data=loopIntCounts,FUN=sum)
+        tumorIS <- aggregate(tumorIS~id,data=loopIntCounts,FUN=sum)
+
+        loopIntCounts$controlIS <- controlIS[match(loopIntCounts$id,controlIS[,1]),2]
+        loopIntCounts$tumorIS <- tumorIS[match(loopIntCounts$id,tumorIS[,1]),2]
+        #
+        loopIntCounts <- loopIntCounts[!duplicated(loopIntCounts$id),]
+    }
+
+    loopIntCounts$controlCovQ <- rank(loopIntCounts$controlIS)/nrow(loopIntCounts)
+    loopIntCounts$tumorCovQ <- rank(loopIntCounts$tumorIS)/nrow(loopIntCounts)
+    loopIntCounts$CovQdiff <- loopIntCounts$controlCovQ - loopIntCounts$tumorCovQ
+    loopIntCounts <- loopIntCounts %>% arrange(CovQdiff)
+    return(loopIntCounts)
+}
+
+# plotFrequencyExp <- function(loopsType, genomeObj, anchorSize, expressionDat, interactionList){
+#     ##########################
+#     #write readable code######
+#     ##########################
+#     hmm <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/chromHMM_enhancers_ChIPSeq_Myc_CvsT.rds')
+#     hmmDiff <- c(hmm$padj < 0.05) %>% replace_na(replace = F)
+#     hmmTumor <- hmm[hmmDiff & hmm$CvsT_log2FC > 1,]
+#     hmmControl<- hmm[hmmDiff & hmm$CvsT_log2FC < -1,]
+#     hmmUnaff <- hmm[!hmmDiff]
+#     freqPlotDat <- c()
+#     expPlotDat <- c()
+#
+#     for(interaction in interactionList){
+#         if(interaction == 'enhancer'){
+#             for(subInteraction in c('enhancer.tumor', 'enhancer.control', 'enhancer.unaffected')){
+#                 if(subInteraction == 'enhancer.tumor'){
+#                     temp <- countloopInteractions(loopsType = loopsType, genomeObj = genomeObj, anchorSize = anchorSize, interactor = 'promoter', anchor = 'enhancer', removeZero = T, removeDuplicates = F, anchorGR = hmmTumor)# %>% filter(id%in%hmmTumor$name)
+#                 }else if(subInteraction == 'enhancer.control'){
+#                     temp <- countloopInteractions(loopsType = loopsType, genomeObj = genomeObj, anchorSize = anchorSize, interactor = 'promoter', anchor = 'enhancer', removeZero = T, removeDuplicates = F, anchorGR = hmmControl) #%>% filter(id%in%hmmControl$name)
+#                 }else if(subInteraction == 'enhancer.unaffected'){
+#                     temp <- countloopInteractions(loopsType = loopsType, genomeObj = genomeObj, anchorSize = anchorSize, interactor = 'promoter', anchor = 'enhancer', removeZero = T, removeDuplicates = F, anchorGR = hmmUnaff) #%>% filter(id%in%hmmUnaff$name)
+#                 }
+#                 temp <- getRNAexpression(temp, expressionDat, genomeObj)
+#                 temp$interaction <- paste0('prom.', subInteraction)
+#                 expPlotDat <- rbind(temp,expPlotDat)
+#                 freqPlotDat[[paste0('prom.', subInteraction)]] <- nrow(temp)
+#             }
+#
+#         }else{
+#             temp <- countloopInteractions(loopsType = loopsType, genomeObj = genomeObj, anchorSize = anchorSize, interactor = 'promoter', anchor = interaction, removeZero = T, removeDuplicates = F)
+#             temp <- getRNAexpression(temp, expressionDat, genomeObj)
+#             temp$interaction <- paste0('prom.', interaction)
+#             expPlotDat <- rbind(temp,expPlotDat)
+#             freqPlotDat[[paste0('prom.', interaction)]] <- nrow(temp)
+#         }
+#
+#     }
+#
+#     print(freqPlotDat)
+#     par(mfrow = c(1,2))
+#     barplot(freqPlotDat, xaxt = 'n', xlab = 'frequency')
+#     text(x = 1:length(freqPlotDat),
+#          labels = names(freqPlotDat),
+#          xpd = NA,
+#          ## Rotate the labels by 35 degrees.
+#          srt = 35,
+#          cex = 0.8,
+#          adj = 1
+#     )
+#     if(sum(!loopsType$tumor) == 0){
+#         boxplot(tumorExp ~ interaction, expPlotDat, xaxt = "n", xlab = 'tumorExpression', ylim = c(0,400))
+#         text(x = 1:length(freqPlotDat),
+#              labels = names(freqPlotDat),
+#              xpd = NA,
+#              ## Rotate the labels by 35 degrees.
+#              srt = 35,
+#              cex = 0.8,
+#              adj = 1)
+#     }else{
+#         boxplot(controlExp ~ interaction, expPlotDat, xaxt = "n", xlab = 'controlExpression', ylim = c(0,400))
+#         text(x = 1:length(freqPlotDat),
+#              labels = names(freqPlotDat),
+#              xpd = NA,
+#              ## Rotate the labels by 35 degrees.
+#              srt = 35,
+#              cex = 0.8,
+#              adj = 1)
+#     }
+#     return(expPlotDat)
+# }
+
+# plotFCdiffLoops <- function(loopType, genesGR, expressionDat, control, tumor, genomeObj){
+#     loopInteractions <- countloopInteractions(loopsType = loopType, genomeObj = genomeObj, interactor = 'promoter', anchor = 'enhancer', removeZero = T)
+#     # loopInteractions <-  countloopInteractions(loopsType = loopInteractions, genomeObj = genomeObj, interactor = 'promoter', anchor = 'H3K27Ac_chipseq', removeZero = T)
+#     loopIS <- getInteractionScore(loopIntCounts = loopInteractions, expressionDat = expressionDat, sumVPs = F) %>% arrange(CovQdiff) %>%
+#         filter(CovQdiff < quantile(CovQdiff, 0.04) | CovQdiff > quantile(CovQdiff, 0.96))
+#
+#
+#     loopIS <- getRNAexpression(loopIS, expressionDat, genomeObj)
+#
+#     loopIS$logFC2 <- expressionDat$TvsC_log2FC[match(loopIS$symbol, expressionDat$gene_id)]
+#     loopIS <- na.omit(loopIS)
+#     rbPal <- colorRampPalette(c('red', 'blue'))
+#     loopIS$col <- rbPal(20)[as.numeric(cut(loopIS$logFC2, breaks = 15))]
+#
+#     par(mfrow = c(3,1))
+#     par(mar = c(0,1,0.5,1))
+#     layout(mat = matrix(c(1,2,2), nrow = 3, ncol = 1))
+#     plot(x = 1:nrow(loopIS), y = loopIS$CovQdiff, col = 'black', type = 'h',  xaxt='n', ann=FALSE, yaxt='n')
+#     plot(x = 1:nrow(loopIS), y = rep(1, nrow(loopIS)), col = loopIS$col, type = 'h',  ylim = c(0,1) ,xaxt='n', ann=FALSE, yaxt='n')
+#
+#     return(loopIS)
+#
+# }
+
+# distanceNormalisation <- function(loopTypeCovQ){
+#
+#     loopTypeCovQ$distance <- apply(loopTypeCovQ, 1, function(x){abs(as.numeric(x[['vp_X1']]) - as.numeric(x[['maxV4CscorePos']]))})
+#     loopTypeCovQ$binID <- cut(loopTypeCovQ$distance, 150, labels=FALSE)
+#
+#     loopTypeCovQ <- as.data.frame(loopTypeCovQ %>%
+#                                       group_by(binID) %>%
+#                                       summarize(averageControlCovQ = mean(controlCovQ)) %>%
+#                                       left_join(loopTypeCovQ) %>%
+#                                       mutate(normControlCovQ = controlCovQ - averageControlCovQ) %>%
+#                                       mutate(normTumorCovQ = tumorCovQ - averageTumorCovQ)
+#     )
+#
+#
+#     return(loopTypeCovQ)
+# }
+
+quantileNormalisation <- function(df){
+  ##########################################################################################################################################################
+  ############Perform quantile normalisation on the complete dataset###############
+  ########################### ##########################################################################################################################
+
+    df_rank <- apply(df,2,rank,ties.method="min")
+    df_sorted <- data.frame(apply(df, 2, sort))
+    df_mean <- apply(df_sorted, 1, mean)
+
+    index_to_mean <- function(my_index, my_mean){
+        return(my_mean[my_index])
+    }
+
+    df_final <- apply(df_rank, 2, index_to_mean, my_mean=df_mean)
+    rownames(df_final) <- rownames(df)
+    return(df_final)
+}
+
+# plotCHiPseqlog2FC <- function(loopType, anchor = 'enhancer', expressionDat, genomeObj, profileSize = 5e3, binSize = 100, bwFile = '/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/MACS2/myc_tumor_sorted.bw'){
+#     vp.anchor <- countloopInteractions(loopsType = loopType, genomeObj = genomeObj, interactor = 'promoter', anchor = anchor, removeZero = T, removeDuplicates = F) %>%
+#         getRNAexpression(expressionDat =  expressionDat, genomeObj = genomeObj) %>%
+#         getInteractionScore(expressionDat = expressionDat) %>%
+#         na.omit() %>%
+#         arrange(log2FC) %>%
+#         filter(log2FC < quantile(log2FC, 0.05) | log2FC > quantile(log2FC, 0.95))
+#
+#     anchorGR <- GRanges(seqnames = vp.anchor$chr, ranges = IRanges(start = vp.anchor$anchor_X1, end = vp.anchor$anchor_X2), id = vp.anchor$id)
+#     vpGR <- GRanges(seqnames= vp.anchor$chr, ranges = IRanges(vp.anchor$vp_X1, width = 1), id = vp.anchor$id)
+#     print(length(vpGR))
+#     # anchorMat <- getChIPAtBinnedRegions(bwFile = bwFile, gR = anchorGr, profileSize = profileSize, binSize = binSize)
+#     vpMat <- getChIPAtBinnedRegions(bwFile = bwFile, gR = vpGR, profileSize = profileSize, binSize = binSize)
+#
+#     rbPal <- colorRampPalette(c('red','blue'))
+#     vp.anchor$col <- rbPal(100)[as.numeric(cut(vp.anchor$log2FC, breaks = 100))]
+#
+#     par(mfrow = c(3,1))
+#     par(mar = c(2,2,0.5,1))
+#     layout(mat = matrix(c(1,1,1,1,2,3,3), nrow = 7, ncol = 1))
+#     # image(anchorMat)
+#     image(vpMat)
+#     plot(x = rownames(vp.anchor), y = rep(1,nrow(vp.anchor)), col = vp.anchor$col, ylim = c(0,1), type = 'h')
+#     plot(x = rownames(vp.anchor), y = vp.anchor$CovQdiff, type = 'h')
+# }
+
+# plotLoopAnchorTypes <- function(loopType, genomeObj, anchorSize = 10e3){
+#   ##########################################################################################################################################################
+#   ############ ###############
+#   #####################################################################################################################################################
+#
+#     vpsGR <- genomeObj$vpsGR
+#     anchorGR <- GRanges(seqnames = loopType$chr, ranges = IRanges(loopType$anchor_X1, loopType$anchor_X2))
+#     anchorVPs <- vpsGR[subjectHits(findOverlaps(anchorGR, vpsGR))]
+#     anchorVPs <- anchorVPs[!duplicated(anchorVPs$name)]
+#     anchorCounts <- data.frame(count = integer(),
+#                                loops = character(),
+#                                type = character())
+#     for(type in unique(vpsGR$type)){
+#         count <-  sum(anchorVPs$type%in%type)
+#         total <-  sum(vpsGR$type%in%type)
+#         notLooped <- total - count
+#         temp <- data.frame(count = c(notLooped, count),
+#                            loops = c('unlooped', 'looped'),
+#                            type = c(type, type))
+#         anchorCounts <- rbind(anchorCounts,temp)
+#     }
+#     p <- ggplot(anchorCounts, aes(x = type, y = count, fill = loops)) + geom_bar(stat="identity") + coord_flip()
+#     show(p)
+#     return(anchorCounts)
+# }
+
+
+
+
+
+# addLoops <- function(loops,yOffset=c(1000,1030),xdiv=1e6,col="darkgray") {
+#
+#     for( x in 1:length( loops$lx ) ) {
+#
+#         plotRegions( loops$lx[x], yrange=c( yOffset[1]+x*0.8, yOffset[2]+x*0.8 ), col=col )
+#         plotRegions( loops$ly[x], yrange=c( yOffset[1]+x*0.8, yOffset[2]+x*0.8 ), col=col )
+#
+#         minX <- ( min( start( loops$lx[x] ), start( loops$lx[x] ), end( loops$ly[x] ), end( loops$ly[x] ) )+5e3 ) / 1e6
+#         maxX <- ( max( start( loops$lx[x] ), start( loops$lx[x] ), end( loops$ly[x] ), end( loops$ly[x] ) )-5e3 ) / 1e6
+#
+#         segments( x0=minX, x1=maxX, y0=yOffset[1]+0.3+x*0.8, lty=2 )
+#
+#     }
+#
+# }
+
+getChIPAtGRanges <- function(bwFile,gR,lab="ChIP.tags",max=NULL) {
+  ##########################################################################################################################################################
+  ############Get the chip-seq signals at given ranges from a BW file, for instance anchors##############
+  ########################### ##########################################################################################################################
+
+
+    ids <- gR$ID
+
+    if(is.null(ids)) {
+
+        ids <- paste0("region_",1:length(gR))
+
+    }
+
+    gR$score <- 0
+
+    bwSel <- BigWigSelection(ranges=gR,colnames="score")
+
+    dat <- import(con=bwFile,selection=bwSel)
+    olap <- findOverlaps(gR,dat)
+
+    if(is.null(max)){
+
+        meanScores <- tapply(dat$score[olap@to],olap@from,mean)
+
+    } else {
+
+        meanScores <- tapply(dat$score[olap@to],olap@from,max)
+
+    }
+    gR$score[as.numeric(names(meanScores))] <- meanScores
+
+    return(gR)
+
+}
+
+binsAround <- function(gR,profileSize=250e3,stepSize=5e3) {
+
+    binOffSets <- seq(from=-profileSize,to=profileSize,by=stepSize)
+    N <- length(binOffSets)
+
+    gR <- resize(gR,width=1,fix="center")
+
+    bins <- rep(gR,N)
+
+    bins$offSet <- rep(binOffSets,each=length(gR))
+    bins$featID <- rep(1:length(gR),N)
+
+    S0 <- start(bins)+bins$offSet
+    out <- GRanges(seqnames(bins),IRanges(S0,S0))
+    out$offSet <- bins$offSet
+    out$featID <- bins$featID
+
+    out <- out[order(out$featID)]
+
+    return(out)
+
+}
+
+clipBoard <- function(x = .Last.value){
+  ##########################################################################################################################################################
+  ############Write to my clipboard ###############
+  ########################### ##########################################################################################################################
+    clipr::write_clip(x)
+}
+
+
+readHICCUPS2D <- function(inFile) {
+  ##########################################################################################################################################################
+  ############Open a HICCUPS file, ###############
+  ########################### ##########################################################################################################################
+
+    tmpFile <- "/tmp/hiccups2D_tmp.txt"
+
+    cmd <- paste("cut -f 1-6 ",inFile," > ",tmpFile,sep="")
+    system(cmd)
+
+    dat <- read.table(tmpFile,sep="\t",stringsAsFactors=F,header=T)
+
+    lx <- GRanges(paste0("chr",dat$chr1),IRanges(dat$x1,dat$x2))
+    ly <- GRanges(paste0("chr",dat$chr2),IRanges(dat$y1,dat$y2))
+
+    return(list(lx=lx,ly=ly))
+
+}
+
+writeHICCUPs2D <- function(lx,ly,outFile,clr=NULL,width=NULL) {
+
+    labs <- c("chr1","x1","x2","chr2","y1","y2","color")
+
+    if(!is.null(width)) {
+
+        lx <- resize(lx,width=width,fix="center")
+        ly <- resize(ly,width=width,fix="center")
+
+    }
+
+    out <- cbind(as.data.frame(lx)[,1:3],as.data.frame(ly)[,1:3])
+
+    if(is.null(clr)) {
+
+        out$color <- rep("0,255,255",nrow(out))
+
+    } else {
+
+        out$color <- rep(clr,nrow(out))
+
+    }
+
+    colnames(out) <- labs
+
+    write.table(out,file=outFile,sep="\t",row.names=F,quote=F)
+
+}
+
+subChr <- function(gR,chr) {
+
+    idx <- as.vector(seqnames(gR))==chr
+    return(gR[idx])
+
+}
+
+
+getINSU <- function(binID,SX,SY,PE1,PE2,bins,scaleParam=200e3){
+  ##########################################################################################################################################################
+  ############Get the insulation score, this is calculated by looking at a certain region and determining how many intearction occur acros this region.#####
+  ############SX = all bins from the viewpoint side. SY = all bins from the anchor side.###############
+  ########################### ##########################################################################################################################
+
+    IDX <- intersect(SX[[as.character(binID)]],SY[[as.character(binID)]])
+
+    xPos <- pmin(start(PE1[IDX]), start(PE2[IDX]))
+    yPos <- pmax(start(PE1[IDX]), start(PE2[IDX]))
+    pos <- bins$pos[as.numeric(binID)]
+
+    A <- length(IDX) #total number of interactions
+    B <- sum(yPos<pos) #total numbers left
+    C <- sum(xPos>pos) #total number right
+
+    return(log2((A-B-C)/A)) #iff all interactions happen left and right but not accros the numerator will be 0
+}
+
+getPartitionINSU <- function(partID,genomeObj,trackID=NULL,binRes=2e3,binWidth=20e3,writeInsuFile=FALSE){
+    if(is.null(trackID)) {
+
+        trackID <- genomeObj$hic$design$trackID[1]
+
+    }
+
+    if(!is.null(genomeObj$data$insuBins)){
+
+        insuBins <- readRDS(genomeObj$data$insuBins)
+
+    } else {
+
+        insuBins <- getInsuBins(genomeObj,binRes=binRes)
+
+    }
+
+    insuBins <- insuBins[insuBins$partID==partID]
+
+    diBins <- resize(insuBins,width=binWidth,fix="center")
+
+    PEdat <- getPartitionReads(partID=partID,trackID=trackID,genomeObj=genomeObj)
+
+    olapX <- findOverlaps(diBins,PEdat$PE1)
+    olapY <- findOverlaps(diBins,PEdat$PE2)
+    SX <- split(olapX@to,olapX@from)
+    SY <- split(olapY@to,olapY@from)
+    binPresent <- intersect(names(SX),names(SY)) #list with bin indexes
+
+    SX <- SX[match(binPresent,names(SX))] #SX is bin with X reads index
+    SY <- SY[match(binPresent,names(SY))] #SY is bin with Y reads index
+
+    insu <- sapply(1:length(binPresent),getINSU,SX=SX,SY=SY, PE1 = PEdat$PE1,PE2 = PEdat$PE2,bins = diBins)
+
+
+    pos <- diBins$pos[as.numeric(binPresent)]
+    chrs <- rep(as.vector(seqnames(diBins))[1],length(pos))
+    out <- data.frame(chr=chrs,pos=pos,INSU=insu,stringsAsFactors=FALSE)
+
+    if(writeInsuFile) {
+
+        insuFile <- paste0(genomeObj$configOpt$projectFolder,trackID,"_DI.txt")
+
+        if(!file.exists(insuFile)) {
+
+            insuHeader <- paste("chr","pos","INSU",sep="\t")
+            cat(c(insuHeader,"\n"),file=insuFile,sep="")
+
+        }
+
+        write.table(out,file=insuFile,sep="\t",row.names=FALSE,col.names=FALSE,quote=FALSE,append=TRUE)
+
+    } else {
+
+        return(out)
+
+    }
+
+}
+
+makeGRanges <- function(df, ranges = 'vp_X1'){
+    gr <- GRanges(seqnames = df$chr, IRanges(df[[ranges]], width = 1), loopID = df$loopID)
+    return(gr)
+}
+
+findTADborders <- function(INSUgr, windowSize, writeHiCCUPsFile = NULL){
+    windows <- windowSize/(width(INSUgr)[1]) #number of bins in total
+
+    if(!is.null(INSUgr$score)){
+
+        INSUscores <- as.zoo(INSUgr$score)
+
+        delta <- c(rep(0,windows/2), rollapply(INSUscores, windows, function(x) (mean(x[1:windows/2])-(mean(x[(windows/2+1):(windows)])))), rep(0,windows)) #calculate the slope of the normalised INSU scores, if it is at zero it is at a peak or valley
+
+        localMaxima <- rollapply(delta,2,function(x) x[1] < 0  & 0 < x[2]) #search for maxima, this is a TAD border
+        localMinima <- rollapply(delta,2,function(x) x[1] > 0  & 0 > x[2]) #local minima, this is the middle of a TAD
+
+        peaks <- as.numeric(INSUscores[localMaxima])
+        valleys <-  as.numeric(INSUscores[localMinima])
+
+        if(length(valleys)<length(peaks)) #this extensive part is for now a workaround, both peaks and valleys need to be alligned to filter for minimal distance between peaks and valleys
+
+        {
+
+            if(index(valleys)[1]>index(peaks)[1])
+
+            { #does not check for diffiring length, work around for now
+
+                valleys <- c(0,valleys)
+
+            }else{
+
+                valleys <- c(valleys,0)
+
+            }
+
+        }
+
+        else if(length(peaks)<length(valleys))
+
+        {
+
+            if(index(peaks)[1]>index(valleys)[1])
+
+            { #does not check for diffiring length, work around for now
+
+                valleys <- valleys[2:length(valleys)]
+
+            }else{
+
+                valleys <- valleys[1:length(valleys)-1]
+
+            }
+
+        }
+
+        landscape <- data.frame(peaks, valleys)
+        filter <- apply(landscape,1,function(x){abs(diff(x)) > 0.25})
+        TADborders <- INSUgr[localMaxima][filter]
+
+    }else{
+
+        print('normalise the score')
+        pass()
+
+    }
+    print(TADborders)
+    if(!is.null(writeHiCCUPsFile)){
+        lx <- data.frame(seqnames(TADborders), start(TADborders), start(TADborders) +1)
+        ly <- data.frame(seqnames(TADborders), end(TADborders), end(TADborders) +1)
+        writeHICCUPs2D(lx = lx, ly = ly, outFile = writeHiCCUPsFile)
+    }
+    return(TADborders)
+}
+
+normalizeINSU <- function(INSUgr){
+    INSUgr$normINSU <- c(lapply(unique(seqnames(INSUgr)), function(x){log2(INSUgr[seqnames(INSUgr) == x]$score / mean(INSUgr[seqnames(INSUgr) == x]$score))}), recursive = T)
+    return(INSUgr)
+}
+
+getAnchorVPs <- function(loops, genomeObj){
+
+    vpsGR <- genomeObj$vpsGR
+    anchorGR <- GRanges(seqnames = loops$chr, ranges = IRanges(start = loops$anchor_X1, end = loops$anchor_X2), id = loops$id, loopID = loops$loopID)
+    print(length(anchorGR))
+    ovl <- findOverlaps(anchorGR, vpsGR)
+    print(length(unique(ovl@from)))
+    mcols(ovl)$AnchorType<- vpsGR$type[subjectHits(ovl)]
+    ovl <- as.data.frame(ovl) %>% group_by(queryHits) %>% summarise(AnchorType = paste(unique(AnchorType), sep = ', ', collapse = ', '))
+    loops$anchorType <- ovl$AnchorType[match(1:nrow(loops), ovl$queryHits)]
+    return(loops)
+}
+
+writeCDT <- function(X,outFldr=NULL,name="test") {
+
+    outF <- paste0(outFldr,name,".cdt")
+
+    Ncols <- ncol(X)
+    ids <- row.names(X)
+    colIDs <- paste0("col_",1:Ncols)
+
+    headerLine <- c("ID","NAME",colIDs)
+
+    cdt <- data.frame(ID=ids,NAME=ids,X)
+    colnames(cdt) <- headerLine
+
+    write.table(cdt,file=outF,sep="\t",row.names=FALSE,quote=FALSE)
+
+}
+
+getRecipPeaks <- function(peakHiCObj,anchorSize=10e3,vpSize=10e3,loopDF=NULL,loopFile=NULL) {
+
+    vpsGR <- peakHiCObj$vpsGR
+
+    if(!is.null(loopDF)){
+
+        loops <- loopDF
+
+    } else{
+
+        if(is.null(loopFile)) {
+
+            rdsFldr <- paste0(peakHiCObj$configOpt$projectFolder,"rds/")
+            loopsFldr <- paste0(rdsFldr,"loops/")
+            nReps <- sum(as.vector(peakHiCObj[["hic"]][["design"]][["HiCMap"]])==peakHiCObj$configOpt$hicCond)
+
+            loopFile <- paste0(loopsFldr,peakHiCObj$name,"_GW_nReps_",nReps,"_peakHiC_wSize_",peakHiCObj$configOpt$peakCalls$wSize,"_qWr_",peakHiCObj$configOpt$peakCalls$qWr,"_alphaFDR_",peakHiCObj$configOpt$peakCalls$alphaFDR,"_loops.txt")
+
+        }
+
+        if(!file.exists(loopFile)) {
+
+            message ("peakHiC loop file not found !")
+            return(NULL)
+
+        } else {
+
+            loops <- fread(loopFile,stringsAsFactors=FALSE,sep="\t",header=TRUE)
+
+        }
+
+    }
+
+    lx <- resize(GRanges(seqnames=loops$chr,IRanges(loops$vp_X1,loops$vp_X2)),width=anchorSize,fix="center")
+    ly <- resize(GRanges(seqnames=loops$chr,IRanges(loops$maxV4CscorePos,loops$maxV4CscorePos)),width=anchorSize,fix="center")
+
+    ovl <- findOverlaps(ly,resize(vpsGR,width=vpSize,fix="center"))
+
+    loopPairs <- paste0(loops$id[ovl@from],".to.",as.vector(vpsGR$vpID)[ovl@to])
+    revPairs <- paste0(as.vector(vpsGR$vpID)[ovl@to],".to.",loops$id[ovl@from])
+
+    loops$loopID <- 1:nrow(loops)
+    recipIDs <- unique(ovl@from[loopPairs%in%revPairs])
+
+    loops$recip <- loops$loopID%in%recipIDs
+
+    recipLoops <- loops[recipIDs,]
+
+    lx$id <- loops$id
+    lx$loopID <- loops$loopID
+
+    out <- list(loops=loops,lx=lx,ly=ly,recipLoops=recipLoops)
+
+    return(out)
+
+}
+
+removeRedundantLoops <- function(RecipPeaks, overlapWindow){
+    loopIDchr <- RecipPeaks$recipLoops[,c('chr', 'loopID')]
+    redundant <- data.frame('loopID'= loopIDchr$loopID, 'redundantLoop' = rep(T,length(loopIDchr)))
+    chrs <- unique(loopIDchr$chr)
+    for(chr in chrs){
+        message(chr)
+        loopID <- loopIDchr$loopID[loopIDchr$chr == chr]
+        lx <- resize(RecipPeaks$lx[loopID], width = overlapWindow, fix = 'center')
+        ly <- resize(RecipPeaks$ly[loopID], width = overlapWindow, fix = 'center')
+        ly$loopID <- lx$loopID
+
+        VPovl <- makeOvlMat(lx)      #of the start position seek the loops with the same start position within the window, also find with the same end position, if one index has both same start and end remove.
+        AnchorOvl <-  makeOvlMat(ly)
+
+        VPovl[,1] <- lx$loopID[VPovl[,1]]
+        VPovl[,2] <- lx$loopID[VPovl[,2]]
+
+        AnchorOvl[,1] <- ly$loopID[AnchorOvl[,1]]
+        AnchorOvl[,2] <- ly$loopID[AnchorOvl[,2]]
+
+        redundantLoops <- VPovl[paste0(VPovl[,1],'.to.',VPovl[,2])%in%paste0(AnchorOvl[,1],'.to.',AnchorOvl[,2]), ]
+        message('searching for redundancy')
+        pb <- txtProgressBar(min = 0, max = max(redundantLoops[,1]), style = 3)
+        for(i in unique(redundantLoops[,1])){
+            setTxtProgressBar(pb, i)
+            if(redundant$redundantLoop[redundant$loopID == i]){
+                remove <- redundantLoops[,2][redundantLoops[,1] == i]
+                redundant$redundantLoop[redundant$loopID%in%remove] <- F
+            }
+        }
+        close(pb)
+    }
+    # print(redundant)
+    nonRedundantLoops <- RecipPeaks$recipLoops[ RecipPeaks$recipLoops$loopID %in% redundant$loopID[redundant$redundantLoop],]
+    RecipPeaks$nonRedundantRecipLoops <-nonRedundantLoops
+    return(RecipPeaks)
+}
+
+makeOvlMat <- function(l){
+    ovl <- findOverlaps(l)
+    ovl <- ovl[!ovl@from == ovl@to]
+
+    xOvl <- pmin(ovl@from, ovl@to)
+    yOvl <- pmax(ovl@from, ovl@to)
+
+    ovl <- matrix(c(xOvl,yOvl), ncol = 2)
+    ovl <- ovl[!duplicated(ovl),]
+    return(ovl)
+}
+
+getNormCounts <- function(countMat, filePath){
+    countMat <- countMat[,!colnames(countMat) == 'input']
+    conditions <- rep(NA, ncol(countMat))
+    dict <- c('C' = 'control', 'T' = 'tumor', 'Toff' = 'Toff', 'input' = 'input')
+    for(i in names(dict)){
+        conditions[which(startsWith(colnames(countMat), i))] <- dict[[i]]
+    }
+    meta <- data.frame(condition = conditions, row.names = colnames(countMat))
+    DDS <- DESeqDataSetFromMatrix(countData = countMat, colData = meta, design = ~condition)
+    DDS <- estimateSizeFactors(DDS)
+    normCounts <- counts(DDS, normalized = T)
+
+    if(length(unique(meta$condition))>3){
+        GR <- readRDS(paste0(filePath, 'All.rds'))
+    }else{
+        GR <- readRDS(paste0(filePath, 'TvC.rds'))
+    }
+    GR$padj[is.na(GR$padj)] <- 1
+    sigGR <- GR[GR$padj < 0.05]
+    sigGRup <- sigGR[sigGR$log2FoldChange > 0]
+    sigGRdown <- sigGR[sigGR$log2FoldChange < 0]
+    sigNormCounts <- normCounts[rownames(normCounts)%in%sigGR$name, ]
+    sigNormCountsUp <- normCounts[rownames(normCounts)%in%sigGRup$name, ]
+    sigNormCountsDown <- normCounts[rownames(normCounts)%in%sigGRdown$name, ]
+
+    return(list('normCounts' = normCounts, 'GR' = GR, 'sigGR' = sigGR,
+                'sigNormCounts'= sigNormCounts, sigGRup = sigGRup,
+                sigGRdown = sigGRdown, sigNormCountsUp = sigNormCountsUp,
+                sigNormCountsDown = sigNormCountsDown))
+}
+
+
+
+createMultipleHeatmap <- function(genomeObj, heatmapObj, leadingNormCounts,
+                                  followingNormCounts, leadingSigGR, followingGR,
+                                  loopCov, expressionDat, ABcompartments,
+                                  plotQuant = NULL, clustAB = NULL){
+    if(is.null(heatmapObj)){
+        # rowV <- rowMeans(leadingNormCounts)
+        # colV <- colMeans(leadingNormCounts)
+        # heatmapObj$rowInd <- order.dendrogram(reorder(as.dendrogram(hclust(dist(leadingNormCounts))), rowV))
+        # heatmapObj$colInd <- order.dendrogram(reorder(as.dendrogram(hclust(dist(t(leadingNormCounts)))), colV))
+        heatmapObj$rowInd <- 1:nrow(leadingNormCounts)
+        heatmapObj$colInd <- 1:ncol(leadingNormCounts)
+        #
+    }
+    leadingNormCounts <- leadingNormCounts[heatmapObj$rowInd,]
+    leadingSigGR <- leadingSigGR[heatmapObj$rowInd]
+    nonZeroCountsLeading <- apply(leadingNormCounts,1,sum) > 0
+    leadingNormCounts <- leadingNormCounts[nonZeroCountsLeading,]
+    leadingSigGR <- leadingSigGR[nonZeroCountsLeading]
+
+    nonZeroCountsFollowing <- apply(followingNormCounts,1,sum) > 0
+    followingNormCounts <- followingNormCounts[nonZeroCountsFollowing,]
+    followingGR <- followingGR[mcols(followingGR)[,1]%in%rownames(followingNormCounts)]
+
+    #set the order of the heatmap from a previous heatmap obj
+
+    ovl <- findOverlaps(leadingSigGR, followingGR)
+    ovl <- ovl[!duplicated(ovl@from)] #TODO: get the highest value or something
+
+    countMat <- matrix(ncol = ncol(followingNormCounts), nrow = nrow(leadingNormCounts), NA)
+    colnames(countMat) <- colnames(followingNormCounts)
+    countMat[ovl@from,] <- followingNormCounts[ovl@to,]
+
+    # vpTypeHeatmapDat <- getVPtypeHeatmapDat(leadingSigGR, genomeObj)
+
+    vpTypeHeatmapDat <- getTussendoortje(leadingSigGR, genomeObj)
+    #
+    coverageHeatmapDat <- getCoverageHeatmapDat(leadingSigGR, loopCov, expressionDat)
+
+    expressionHeatmapDat <- getExpressionHeatmapDat(leadingSigGR, loops = loopCov, expressionDat = expressionDat, genomeObj = genomeObj)
+    #
+    compartimentHeatmapDat <- getABcomp(leadingSigGR, ABcompartments)
+    if(!is.null(plotQuant)){
+        createQuantativePlots(coverageHeatmapDat, expressionHeatmapDat, compartimentHeatmapDat, vpTypeHeatmapDat, genomeObj$vpsGR, plotQuant)
+    }
+    colCov = colorRamp2(c(1,0,-1), colors = c('red', 'white', 'blue'))
+    colRNA = colorRamp2(c(5,0,-5), colors = c('red', 'white', 'blue'))
+    if(is.null(clustAB)){
+        h1 <- Heatmap(scale_rows(leadingNormCounts), na_col = 'grey', name = 'MYC_chipseq')#,row_order = 1:nrow(leadingNormCounts) [,heatmapObj$colInd]
+
+        h2 <- Heatmap(scale_rows(countMat),na_col = 'grey', name = 'H3K27Ac_chipseq', column_order = c(1:ncol(countMat)))
+        h3 <- Heatmap(expressionHeatmapDat, na_col = 'white', name = 'log2FC_RNA', col = colRNA)
+        h4 <- Heatmap(coverageHeatmapDat, na_col = 'white', name = 'CovQdiff')#, col =colCov
+        # h6 <- Heatmap(vpTypeHeatmapDat, na_col = 'white', col = c('CTCF' = 'lightgreen','enhancer' = 'purple','promoter' = 'blue'), name = 'BindingSiteType')
+        h7 <- Heatmap(compartimentHeatmapDat[[1]],  na_col = 'white', col = c('A' = 'red','B' = 'blue'), name = 'controlABcompartments')
+        h8 <- Heatmap(compartimentHeatmapDat[[2]],  na_col = 'white', col = c('A' = 'red','B' = 'blue'), name = 'tumorABcompartments')
+        hProm <- Heatmap(vpTypeHeatmapDat[[1]], na_col = 'white', col = c('CTCF' = 'lightgreen','enhancer' = 'purple','promoter' = 'blue'), name = 'BindingSiteTypeProm', show_heatmap_legend = F)
+        hCTCF <- Heatmap(vpTypeHeatmapDat[[2]], na_col = 'white', col = c('CTCF' = 'lightgreen','enhancer' = 'purple','promoter' = 'blue'), name = 'BindingSiteTypeCTCF', show_heatmap_legend = F)
+        hEnh <- Heatmap(vpTypeHeatmapDat[[3]], na_col = 'white', col = c('CTCF' = 'lightgreen','enhancer' = 'purple','promoter' = 'blue'), name = 'BindingSiteTypeEnh', show_heatmap_legend = F)
+        return(list(leading = h1, following = h2, expression = h3, coverage = h4, prom = hProm, ctcf = hCTCF, enh = hEnh, ABctrl = h7, ABtum  = h8))
+    }else{
+        ABdat <- data.frame(control = compartimentHeatmapDat[[1]], tumor = compartimentHeatmapDat[[2]])
+        indexes <- list("AA" = ABdat$control == "A" & ABdat$tumor == "A",
+                        "BB" =  ABdat$control == "B" & ABdat$tumor == "B",
+                        "AB" = ABdat$control == "A" & ABdat$tumor == "B",
+                        "BA" =ABdat$control == "B" & ABdat$tumor == "A"
+        )
+        indexes[[clustAB]][is.na(indexes[[clustAB]])] <- F
+        h1 <- Heatmap(scale_rows(leadingNormCounts[indexes[[clustAB]], ]), name = 'MYC_chipseq')#,row_order = 1:nrow(leadingNormCounts) [,heatmapObj$colInd]
+
+        h2 <- Heatmap(scale_rows(countMat[indexes[[clustAB]], ]),na_col = 'grey', name = 'H3K27Ac_chipseq', column_order = c(1:ncol(countMat)))
+
+        h3 <- Heatmap(expressionHeatmapDat[indexes[[clustAB]]], na_col = 'white', name = 'log2FC_RNA', col = colRNA)
+
+        h4 <- Heatmap(coverageHeatmapDat[indexes[[clustAB]]], na_col = 'white', name = 'CovQdiff')#, col =colCov
+
+
+        h7 <- Heatmap(compartimentHeatmapDat[[1]][indexes[[clustAB]]],  na_col = 'white', col = c('A' = 'red','B' = 'blue'), name = 'controlABcompartments')
+        h8 <- Heatmap(compartimentHeatmapDat[[2]][indexes[[clustAB]]],  na_col = 'white', col = c('A' = 'red','B' = 'blue'), name = 'tumorABcompartments')
+        hProm <- Heatmap(vpTypeHeatmapDat[[1]][indexes[[clustAB]]], na_col = 'white', col = c('CTCF' = 'lightgreen','enhancer' = 'purple','promoter' = 'blue'), name = 'BindingSiteTypeProm', show_heatmap_legend = F)
+        hCTCF <- Heatmap(vpTypeHeatmapDat[[2]][indexes[[clustAB]]], na_col = 'white', col = c('CTCF' = 'lightgreen','enhancer' = 'purple','promoter' = 'blue'), name = 'BindingSiteTypeCTCF', show_heatmap_legend = F)
+        hEnh <- Heatmap(vpTypeHeatmapDat[[3]][indexes[[clustAB]]], na_col = 'white', col = c('CTCF' = 'lightgreen','enhancer' = 'purple','promoter' = 'blue'), name = 'BindingSiteTypeEnh', show_heatmap_legend = F)
+        return(list(leading = h1, following = h2, expression = h3, coverage = h4, prom = hProm, ctcf = hCTCF, enh = hEnh, ABctrl = h7, ABtum  = h8))
+        # return(h1+h2+h3+h4+hProm+hCTCF+hEnh+h7+h8)
+
+    }
+
+
+}
+
+createQuantativePlots <- function(covQdiffDat, expressionDat, compartimentDat, vpTypeDat, vpsGR, plotFile){
+    png(paste0(plotFile, 'CoverageExpression.png'))
+    par(mfrow = c(2,1))
+    boxplot(covQdiffDat, horizontal = T, ylim = c(-1, 1), xlim = c(0.75, 1.25), ylab = 'CovQdiff')
+    boxplot(expressionDat, horizontal = T, xlim = c(0.75, 1.25), ylab = 'RNA log2FC')
+    dev.off()
+
+
+    plotDat <- data.frame(compartment = c(compartimentDat[[1]], compartimentDat[[2]]),
+                          type = c(rep('control', length(compartimentDat[[1]])), rep('tumor', length(compartimentDat[[2]]))))
+    p1 <- ggplot(plotDat, aes(fill = compartment, x = type)) +geom_bar()
+    ggsave(paste0(plotFile, 'ABcompartment.png'), plot = p1, device = 'png')
+
+    vpType <- paste0(vpTypeDat[[1]], ", ", vpTypeDat[[2]], ", ", vpTypeDat[[3]])
+
+    vpType <- stringr::str_remove(vpType, "NA, ")
+
+    vpType <- stringr::str_remove(vpType, "NA, ")
+
+    vpType <- stringr::str_remove(vpType, ", NA")
+
+    vpType[vpType == 'NA'] <- "uncatogarized"
+
+    plotDat <- data.frame(vpType = vpType, plot = 'plot')
+    p2 <- ggplot(plotDat, aes(fill =vpType, x = plot )) +geom_bar()
+    ggsave(paste0(plotFile, 'VPtype.png'), plot = p2, device = 'png')
+
+    plotDat <- data.frame(vpType = c(vpTypeDat[[1]], vpTypeDat[[2]], vpTypeDat[[3]], rep('uncatogarized', sum(vpType == 'uncatogarized'))), plot = 'plot')
+    plotDat <- na.omit(plotDat)
+    p3 <- ggplot(plotDat, aes(fill =vpType, x = plot )) + geom_bar()
+    ggsave(paste0(plotFile, 'VPtypeMerged.png'), plot = p3, device = 'png')
+}
+
+getABcomp <- function(leadingGR, ABcompartiment){
+    controlAB <- rep(NA, length(leadingGR))
+    tumorAB <- rep(NA, length(leadingGR))
+
+    ovl <- findOverlaps(leadingGR, ABcompartiment)
+    ovl <- ovl[!duplicated(ovl)] #make this better
+
+    controlAB[ovl@from] <- ABcompartiment$controlComp[ovl@to]
+    tumorAB[ovl@from] <- ABcompartiment$tumorComp[ovl@to]
+
+    return(list(controlAB, tumorAB))
+}
+
+getVPtypeHeatmapDat <- function(leadingGR, genomeObj){
+    ovl <- findOverlaps(leadingGR, genomeObj$vpsGR)
+    vpType <- c(rep(NA, length(leadingGR)))
+    colors <- c('TSS_inactive' = 'promoter', 'TSS_active' = 'promoter',
+                'CTCF' = 'CTCF', 'enhancer' = 'enhancer', 'promoter' = 'promoter')
+    for(type in c('TSS_inactive', 'TSS_active', 'CTCF', 'enhancer', 'promoter')){#, 'promoter'
+        ovl <- findOverlaps(leadingGR, genomeObj$vpsGR[genomeObj$vpsGR$type == type])
+        ovl <- ovl[!duplicated(ovl@from)]
+        vpType[ovl@from] <- paste(vpType[ovl@from],colors[type])
+    }
+
+    return(vpType)
+}
+
+getTussendoortje <- function(leadingGR, genomeObj){
+    ovl <- findOverlaps(leadingGR, genomeObj$vpsGR)
+    promoter <- c(rep(NA, length(leadingGR)))
+    ctcf <- c(rep(NA, length(leadingGR)))
+    enhancer <- c(rep(NA, length(leadingGR)))
+    colors <- c('TSS_inactive' = 'promoter', 'TSS_active' = 'promoter',
+                'CTCF' = 'CTCF', 'enhancer' = 'enhancer', 'promoter' = 'promoter')
+    for(type in c('TSS_inactive', 'TSS_active', 'promoter')){#, 'promoter'
+        ovl <- findOverlaps(leadingGR, genomeObj$vpsGR[genomeObj$vpsGR$type == type])
+        ovl <- ovl[!duplicated(ovl@from)]
+        promoter[ovl@from] <- colors[type]
+    }
+
+    ovl <-  findOverlaps(leadingGR, genomeObj$vpsGR[genomeObj$vpsGR$type == 'CTCF'])
+    ovl <- ovl[!duplicated(ovl@from)]
+    ctcf[ovl@from] <- colors['CTCF']
+
+    ovl <- findOverlaps(leadingGR, genomeObj$vpsGR[genomeObj$vpsGR$type == 'enhancer'])
+    ovl <- ovl[!duplicated(ovl@from)]
+    enhancer[ovl@from] <- colors['enhancer']
+
+    return(list(promoter, ctcf, enhancer))
+}
+
+getCoverageHeatmapDat <- function(leadingGR, loopCov, expressionDat){
+    ###TODO: get the cov diff within the group instead of wide.
+    IS <- as.data.frame(loopCov) %>% getInteractionScore(expressionDat = expressionDat) %>%
+        filter(controlCovQ <  0.975 & controlCovQ > 0.025) %>% filter(tumorCovQ < 0.975& tumorCovQ > 0.025)
+    GR <- resize(GRanges(IS$chr, IRanges(IS$vp_X1,IS$vp_X1+1)), width = 10e3, fix = 'center')
+
+    heatmapDat <- rep(NA, length(leadingGR))
+
+    ovl <- as.data.frame(findOverlaps(leadingGR, GR))
+    ovl$CovQdiff <- IS$CovQdiff[ovl$subjectHits]
+
+    ovl <- aggregate(ovl$CovQdiff, list(ovl$queryHits), median)
+    heatmapDat[ovl[,1]] <- ovl[,2]
+    heatmapDat[is.na(heatmapDat)] <- 0
+    return(heatmapDat)
+}
+
+getExpressionHeatmapDat <- function(leadingGR, loops, expressionDat, genomeObj){
+    rnaExp <- getRNAexpression(loops, expressionDat = expressionDat, genomeObj = genomeObj)
+    rnaExp <- rnaExp[!is.na(rnaExp$log2FC),]
+    rnaExpGR <- resize(GRanges(rnaExp$chr, IRanges(rnaExp$vp_X1, rnaExp$vp_X2)), width = 10e3, fix = 'center')
+
+    exp <- c(rep(0, length(leadingGR)))
+    ovl <- findOverlaps(leadingGR, rnaExpGR)
+    ovl <- as.data.frame(findOverlaps(leadingGR, rnaExpGR))
+
+    ovl$log2FC <- rnaExp$log2FC[ovl$subjectHits]
+
+    ovl <- aggregate(ovl$log2FC, list(ovl$queryHits), median)
+    exp[ovl[,1]] <- ovl[,2]
+
+    return(exp)
+}
+
+
+scale_rows = function(x){
+    m = apply(x, 1, mean, na.rm = T)
+    s = apply(x, 1, sd, na.rm = T)
+    return((x - m) / s)
+}
+scale_col = function(x){
+    m = mean(x, na.rm = T)
+    s = sd(x, na.rm = T)
+    return((x - m) / s)
+}
+
+quantcut <- function (x, q = 4, na.rm = TRUE, ...)
+{
+    if (length(q) == 1)
+        q <- seq(0, 1, length.out = q + 1)
+    quant <- quantile(x, q, na.rm = na.rm)
+    dups <- duplicated(quant)
+    if (any(dups)) {
+        flag <- x %in% unique(quant[dups])
+        retval <- ifelse(flag, paste("[", as.character(x), "]",
+                                     sep = ""), NA)
+        uniqs <- unique(quant)
+        reposition <- function(cut) {
+            flag <- x >= cut
+            if (sum(flag) == 0)
+                return(cut)
+            else return(min(x[flag], na.rm = na.rm))
+        }
+        newquant <- sapply(uniqs, reposition)
+        retval[!flag] <- as.character(cut(x[!flag], breaks = newquant,
+                                          include.lowest = TRUE, ...))
+        levs <- unique(retval[order(x)])
+        retval <- factor(retval, levels = levs)
+        mkpairs <- function(x) sapply(x, function(y) if (length(y) ==
+                                                         2)
+            y[c(2, 2)]
+            else y[2:3])
+        pairs <- mkpairs(strsplit(levs, "[^0-9+\\.\\-]+"))
+        rownames(pairs) <- c("lower.bound", "upper.bound")
+        colnames(pairs) <- levs
+        closed.lower <- rep(F, ncol(pairs))
+        closed.upper <- rep(T, ncol(pairs))
+        closed.lower[1] <- TRUE
+        for (i in 2:ncol(pairs)) if (pairs[1, i] == pairs[1,
+                                                          i - 1] && pairs[1, i] == pairs[2, i - 1])
+            closed.lower[i] <- FALSE
+        for (i in 1:(ncol(pairs) - 1)) if (pairs[2, i] == pairs[1,
+                                                                i + 1] && pairs[2, i] == pairs[2, i + 1])
+            closed.upper[i] <- FALSE
+        levs <- ifelse(pairs[1, ] == pairs[2, ], pairs[1, ],
+                       paste(ifelse(closed.lower, "[", "("), pairs[1, ],
+                             ",", pairs[2, ], ifelse(closed.upper, "]", ")"),
+                             sep = ""))
+        levels(retval) <- levs
+    }
+    else retval <- cut(x, quant, include.lowest = TRUE, ...)
+    return(retval)
+}
+
+createFCgenomicRanges <- function(inputGR,BWlist){
+    GR <- inputGR
+    for(name in names(BWlist)){
+        bw <- BWlist[[name]]
+        ovl <- as.data.frame(findOverlaps(GR, bw))
+        ovl$FE <- bw$score[ovl$subjectHits]
+        mcols(GR)[[name]] <- aggregate(ovl, by=list(ovl$queryHits), FUN = mean)$FE
+    }
+    GR$FC <- mcols(GR)[[names(BWlist)[2]]] / mcols(GR)[[names(BWlist)[1]]]
+    return(GR)
+}
+
+getNormCounts <- function(countMat, filePath){
+    conditions <- rep(NA, ncol(countMat))
+    dict <- c('C' = 'control', 'T' = 'tumor', 'Toff' = 'Toff', 'input' = 'input')
+    for(i in names(dict)){
+        conditions[which(startsWith(colnames(countMat), i))] <- dict[[i]]
+    }
+    meta <- data.frame(condition = conditions, row.names = colnames(countMat))
+    DDS <- DESeqDataSetFromMatrix(countData = countMat, colData = meta, design = ~condition)
+    DDS <- estimateSizeFactors(DDS)
+    normCounts <- counts(DDS, normalized = T)
+
+    if(length(unique(meta$condition))>3){
+        GR <- readRDS(paste0(filePath, 'All.rds'))
+    }else{
+        GR <- readRDS(paste0(filePath, 'TvC.rds'))
+    }
+    GR$padj[is.na(GR$padj)] <- 1
+    sigGR <- GR[GR$padj < 0.05]
+    sigGRup <- sigGR[sigGR$log2FoldChange > 0]
+    sigGRdown <- sigGR[sigGR$log2FoldChange < 0]
+    sigNormCounts <- normCounts[rownames(normCounts)%in%sigGR$name, ]
+    sigNormCountsUp <- normCounts[rownames(normCounts)%in%sigGRup$name, ]
+    sigNormCountsDown <- normCounts[rownames(normCounts)%in%sigGRdown$name, ]
+
+    return(list('normCounts' = normCounts, 'GR' = GR, 'sigGR' = sigGR,
+                'sigNormCounts'= sigNormCounts, sigGRup = sigGRup,
+                sigGRdown = sigGRdown, sigNormCountsUp = sigNormCountsUp,
+                sigNormCountsDown = sigNormCountsDown))
+}
+
+
+
+createMultipleHeatmap <- function(genomeObj, heatmapObj, leadingNormCounts,
+                                  followingNormCounts, leadingSigGR, followingGR,
+                                  loopCov, expressionDat, ABcompartments,
+                                  plotQuant = NULL, clustAB = NULL){
+    if(is.null(heatmapObj)){
+        # rowV <- rowMeans(leadingNormCounts)
+        # colV <- colMeans(leadingNormCounts)
+        # heatmapObj$rowInd <- order.dendrogram(reorder(as.dendrogram(hclust(dist(leadingNormCounts))), rowV))
+        # heatmapObj$colInd <- order.dendrogram(reorder(as.dendrogram(hclust(dist(t(leadingNormCounts)))), colV))
+        heatmapObj$rowInd <- 1:nrow(leadingNormCounts)
+        heatmapObj$colInd <- 1:ncol(leadingNormCounts)
+        #
+    }
+    leadingNormCounts <- leadingNormCounts[heatmapObj$rowInd,]
+    leadingSigGR <- leadingSigGR[heatmapObj$rowInd]
+    nonZeroCountsLeading <- apply(leadingNormCounts,1,sum) > 0
+    leadingNormCounts <- leadingNormCounts[nonZeroCountsLeading,]
+    leadingSigGR <- leadingSigGR[nonZeroCountsLeading]
+
+    nonZeroCountsFollowing <- apply(followingNormCounts,1,sum) > 0
+    followingNormCounts <- followingNormCounts[nonZeroCountsFollowing,]
+    followingGR <- followingGR[mcols(followingGR)[,1]%in%rownames(followingNormCounts)]
+
+    #set the order of the heatmap from a previous heatmap obj
+
+    ovl <- findOverlaps(leadingSigGR, followingGR)
+    ovl <- ovl[!duplicated(ovl@from)] #TODO: get the highest value or something
+
+    countMat <- matrix(ncol = ncol(followingNormCounts), nrow = nrow(leadingNormCounts), NA)
+    colnames(countMat) <- colnames(followingNormCounts)
+    countMat[ovl@from,] <- followingNormCounts[ovl@to,]
+
+    # vpTypeHeatmapDat <- getVPtypeHeatmapDat(leadingSigGR, genomeObj)
+
+    vpTypeHeatmapDat <- getTussendoortje(leadingSigGR, genomeObj)
+    #
+    coverageHeatmapDat <- getCoverageHeatmapDat(leadingSigGR, loopCov, expressionDat)
+
+    # expressionHeatmapDat <- getExpressionHeatmapDat(leadingSigGR, loops = loopCov, expressionDat = expressionDat, genomeObj = genomeObj)
+    #
+    compartimentHeatmapDat <- getABcomp(leadingSigGR, ABcompartments)
+    if(!is.null(plotQuant)){
+        createQuantativePlots(coverageHeatmapDat, expressionHeatmapDat, compartimentHeatmapDat, vpTypeHeatmapDat, genomeObj$vpsGR, plotQuant)
+    }
+    colCov = colorRamp2(c(1,0,-1), colors = c('red', 'white', 'blue'))
+    colRNA = colorRamp2(c(5,0,-5), colors = c('red', 'white', 'blue'))
+    if(is.null(clustAB)){
+
+        nonNa <- countMat[rowSums(is.na(countMat)) == 0, ]
+
+        h2 <- Heatmap(scale_rows(countMat[nonNa,]),na_col = 'grey', name = 'H3K27Ac_chipseq')
+
+        h1 <- Heatmap(scale_rows(leadingNormCounts[nonNa,]), na_col = 'grey', name = 'MYC_chipseq',  column_order = c(1:ncol(leadingNormCounts)))#,row_order = 1:nrow(leadingNormCounts) [,heatmapObj$colInd]
+
+        # h3 <- Heatmap(expressionHeatmapDat, na_col = 'white', name = 'log2FC_RNA', col = colRNA)
+        h4 <- Heatmap(coverageHeatmapDat[nonNa], na_col = 'white', name = 'CovQdiff')#, col =colCov
+        # h6 <- Heatmap(vpTypeHeatmapDat, na_col = 'white', col = c('CTCF' = 'lightgreen','enhancer' = 'purple','promoter' = 'blue'), name = 'BindingSiteType')
+        h7 <- Heatmap(compartimentHeatmapDat[[1]][nonNa],  na_col = 'white', col = c('A' = 'red','B' = 'blue'), name = 'controlABcompartments')
+        h8 <- Heatmap(compartimentHeatmapDat[[2]][nonNa],  na_col = 'white', col = c('A' = 'red','B' = 'blue'), name = 'tumorABcompartments')
+        hProm <- Heatmap(vpTypeHeatmapDat[[1]][nonNa], na_col = 'white', col = c('CTCF' = 'lightgreen','enhancer' = 'purple','promoter' = 'blue'), name = 'BindingSiteTypeProm', show_heatmap_legend = F)
+        hCTCF <- Heatmap(vpTypeHeatmapDat[[2]][nonNa], na_col = 'white', col = c('CTCF' = 'lightgreen','enhancer' = 'purple','promoter' = 'blue'), name = 'BindingSiteTypeCTCF', show_heatmap_legend = F)
+        hEnh <- Heatmap(vpTypeHeatmapDat[[3]][nonNa], na_col = 'white', col = c('CTCF' = 'lightgreen','enhancer' = 'purple','promoter' = 'blue'), name = 'BindingSiteTypeEnh', show_heatmap_legend = F)
+        # return(list(leading = h1, following = h2, coverage = h4, prom = hProm, ctcf = hCTCF, enh = hEnh, ABctrl = h7, ABtum  = h8))#, expression = h3
+        return(h2+h1+h4+hProm+hCTCF+hEnh+h7+h8)
+    }else{
+        ABdat <- data.frame(control = compartimentHeatmapDat[[1]], tumor = compartimentHeatmapDat[[2]])
+        indexes <- list("AA" = ABdat$control == "A" & ABdat$tumor == "A",
+                        "BB" =  ABdat$control == "B" & ABdat$tumor == "B",
+                        "AB" = ABdat$control == "A" & ABdat$tumor == "B",
+                        "BA" =ABdat$control == "B" & ABdat$tumor == "A"
+        )
+        indexes[[clustAB]][is.na(indexes[[clustAB]])] <- F
+        h1 <- Heatmap(scale_rows(leadingNormCounts[indexes[[clustAB]], ]), name = 'MYC_chipseq')#,row_order = 1:nrow(leadingNormCounts) [,heatmapObj$colInd]
+
+        h2 <- Heatmap(scale_rows(countMat[indexes[[clustAB]], ]),na_col = 'grey', name = 'H3K27Ac_chipseq', column_order = c(1:ncol(countMat)))
+
+        h3 <- Heatmap(expressionHeatmapDat[indexes[[clustAB]]], na_col = 'white', name = 'log2FC_RNA', col = colRNA)
+
+        h4 <- Heatmap(coverageHeatmapDat[indexes[[clustAB]]], na_col = 'white', name = 'CovQdiff')#, col =colCov
+
+
+        h7 <- Heatmap(compartimentHeatmapDat[[1]][indexes[[clustAB]]],  na_col = 'white', col = c('A' = 'red','B' = 'blue'), name = 'controlABcompartments')
+        h8 <- Heatmap(compartimentHeatmapDat[[2]][indexes[[clustAB]]],  na_col = 'white', col = c('A' = 'red','B' = 'blue'), name = 'tumorABcompartments')
+        hProm <- Heatmap(vpTypeHeatmapDat[[1]][indexes[[clustAB]]], na_col = 'white', col = c('CTCF' = 'lightgreen','enhancer' = 'purple','promoter' = 'blue'), name = 'BindingSiteTypeProm', show_heatmap_legend = F)
+        hCTCF <- Heatmap(vpTypeHeatmapDat[[2]][indexes[[clustAB]]], na_col = 'white', col = c('CTCF' = 'lightgreen','enhancer' = 'purple','promoter' = 'blue'), name = 'BindingSiteTypeCTCF', show_heatmap_legend = F)
+        hEnh <- Heatmap(vpTypeHeatmapDat[[3]][indexes[[clustAB]]], na_col = 'white', col = c('CTCF' = 'lightgreen','enhancer' = 'purple','promoter' = 'blue'), name = 'BindingSiteTypeEnh', show_heatmap_legend = F)
+        # return(list(leading = h1, following = h2, expression = h3, coverage = h4, prom = hProm, ctcf = hCTCF, enh = hEnh, ABctrl = h7, ABtum  = h8))
+        return(h1+h2+h3+h4+hProm+hCTCF+hEnh+h7+h8)
+
+    }
+
+
+}
+
+createQuantativePlots <- function(covQdiffDat, expressionDat, compartimentDat, vpTypeDat, vpsGR, plotFile){
+    png(paste0(plotFile, 'CoverageExpression.png'))
+    par(mfrow = c(2,1))
+    boxplot(covQdiffDat, horizontal = T, ylim = c(-1, 1), xlim = c(0.75, 1.25), ylab = 'CovQdiff')
+    boxplot(expressionDat, horizontal = T, xlim = c(0.75, 1.25), ylab = 'RNA log2FC')
+    dev.off()
+
+
+    plotDat <- data.frame(compartment = c(compartimentDat[[1]], compartimentDat[[2]]),
+                          type = c(rep('control', length(compartimentDat[[1]])), rep('tumor', length(compartimentDat[[2]]))))
+    p1 <- ggplot(plotDat, aes(fill = compartment, x = type)) +geom_bar()
+    ggsave(paste0(plotFile, 'ABcompartment.png'), plot = p1, device = 'png')
+
+    vpType <- paste0(vpTypeDat[[1]], ", ", vpTypeDat[[2]], ", ", vpTypeDat[[3]])
+
+    vpType <- stringr::str_remove(vpType, "NA, ")
+
+    vpType <- stringr::str_remove(vpType, "NA, ")
+
+    vpType <- stringr::str_remove(vpType, ", NA")
+
+    vpType[vpType == 'NA'] <- "uncatogarized"
+
+    plotDat <- data.frame(vpType = vpType, plot = 'plot')
+    p2 <- ggplot(plotDat, aes(fill =vpType, x = plot )) +geom_bar()
+    ggsave(paste0(plotFile, 'VPtype.png'), plot = p2, device = 'png')
+
+    plotDat <- data.frame(vpType = c(vpTypeDat[[1]], vpTypeDat[[2]], vpTypeDat[[3]], rep('uncatogarized', sum(vpType == 'uncatogarized'))), plot = 'plot')
+    plotDat <- na.omit(plotDat)
+    p3 <- ggplot(plotDat, aes(fill =vpType, x = plot )) + geom_bar()
+    ggsave(paste0(plotFile, 'VPtypeMerged.png'), plot = p3, device = 'png')
+}
+
+getABcomp <- function(leadingGR, ABcompartiment){
+    controlAB <- rep(NA, length(leadingGR))
+    tumorAB <- rep(NA, length(leadingGR))
+
+    ovl <- findOverlaps(leadingGR, ABcompartiment)
+    ovl <- ovl[!duplicated(ovl)] #make this better
+
+    controlAB[ovl@from] <- ABcompartiment$controlComp[ovl@to]
+    tumorAB[ovl@from] <- ABcompartiment$tumorComp[ovl@to]
+
+    return(list(controlAB, tumorAB))
+}
+
+getVPtypeHeatmapDat <- function(leadingGR, genomeObj){
+    ovl <- findOverlaps(leadingGR, genomeObj$vpsGR)
+    vpType <- c(rep(NA, length(leadingGR)))
+    colors <- c('TSS_inactive' = 'promoter', 'TSS_active' = 'promoter',
+                'CTCF' = 'CTCF', 'enhancer' = 'enhancer', 'promoter' = 'promoter')
+    for(type in c('TSS_inactive', 'TSS_active', 'CTCF', 'enhancer', 'promoter')){#, 'promoter'
+        ovl <- findOverlaps(leadingGR, genomeObj$vpsGR[genomeObj$vpsGR$type == type])
+        ovl <- ovl[!duplicated(ovl@from)]
+        vpType[ovl@from] <- paste(vpType[ovl@from],colors[type])
+    }
+
+    return(vpType)
+}
+
+getTussendoortje <- function(leadingGR, genomeObj){
+    ovl <- findOverlaps(leadingGR, genomeObj$vpsGR)
+    promoter <- c(rep(NA, length(leadingGR)))
+    ctcf <- c(rep(NA, length(leadingGR)))
+    enhancer <- c(rep(NA, length(leadingGR)))
+
+    enhancers <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/chromHMM_enhancers_ChIPSeq_Myc_CvsT.rds')
+
+    promoters <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/tetMyc_rnaseqPromoters_Kress_et_al_data.rds')
+    colors <- c('TSS_inactive' = 'promoter', 'TSS_active' = 'promoter',
+                'CTCF' = 'CTCF', 'enhancer' = 'enhancer', 'promoter' = 'promoter')
+    for(type in c('TSS_inactive', 'TSS_active', 'promoter')){#, 'promoter'
+        ovl <- findOverlaps(leadingGR, genomeObj$vpsGR[genomeObj$vpsGR$type == type])
+        ovl <- ovl[!duplicated(ovl@from)]
+        promoter[ovl@from] <- colors[type]
+    }
+
+    ovl <- findOverlaps(leadingGR, promoters)
+    ovl <- ovl[!duplicated(ovl@from)]
+    promoter[ovl@from] <- colors[type]
+
+    ovl <-  findOverlaps(leadingGR, genomeObj$vpsGR[genomeObj$vpsGR$type == 'CTCF'])
+    ovl <- ovl[!duplicated(ovl@from)]
+    ctcf[ovl@from] <- colors['CTCF']
+
+    ovl <- findOverlaps(leadingGR, enhancers)
+    ovl <- ovl[!duplicated(ovl@from)]
+    enhancer[ovl@from] <- colors['enhancer']
+
+    ovl <- findOverlaps(leadingGR, genomeObj$vpsGR[genomeObj$vpsGR$type == 'enhancer'])
+    ovl <- ovl[!duplicated(ovl@from)]
+    enhancer[ovl@from] <- colors['enhancer']
+
+    return(list(promoter, ctcf, enhancer))
+}
+
+getCoverageHeatmapDat <- function(leadingGR, loopCov, expressionDat){
+    ###TODO: get the cov diff within the group instead of wide.
+    IS <- as.data.frame(loopCov) %>% getInteractionScore(expressionDat = expressionDat) %>%
+        filter(controlCovQ <  0.975 & controlCovQ > 0.025) %>% filter(tumorCovQ < 0.975& tumorCovQ > 0.025)
+    GR <- resize(GRanges(IS$chr, IRanges(IS$vp_X1,IS$vp_X1+1)), width = 10e3, fix = 'center')
+
+    heatmapDat <- rep(NA, length(leadingGR))
+
+    ovl <- as.data.frame(findOverlaps(leadingGR, GR))
+    ovl$CovQdiff <- IS$CovQdiff[ovl$subjectHits]
+
+    ovl <- aggregate(ovl$CovQdiff, list(ovl$queryHits), median)
+    heatmapDat[ovl[,1]] <- ovl[,2]
+    heatmapDat[is.na(heatmapDat)] <- 0
+    return(heatmapDat)
+}
+
+getExpressionHeatmapDat <- function(leadingGR, loops, expressionDat, genomeObj){
+    rnaExp <- getRNAexpression(loops, expressionDat = expressionDat, genomeObj = genomeObj)
+    rnaExp <- rnaExp[!is.na(rnaExp$log2FC),]
+    rnaExpGR <- resize(GRanges(rnaExp$chr, IRanges(rnaExp$vp_X1, rnaExp$vp_X2)), width = 10e3, fix = 'center')
+
+    exp <- c(rep(0, length(leadingGR)))
+    ovl <- findOverlaps(leadingGR, rnaExpGR)
+    ovl <- as.data.frame(findOverlaps(leadingGR, rnaExpGR))
+
+    ovl$log2FC <- rnaExp$log2FC[ovl$subjectHits]
+
+    ovl <- aggregate(ovl$log2FC, list(ovl$queryHits), median)
+    exp[ovl[,1]] <- ovl[,2]
+
+    return(exp)
+}
+
+
+scale_rows = function(x){
+    m = apply(x, 1, mean, na.rm = T)
+    s = apply(x, 1, sd, na.rm = T)
+    return((x - m) / s)
+}
+scale_col = function(x){
+    m = mean(x, na.rm = T)
+    s = sd(x, na.rm = T)
+    return((x - m) / s)
+}
+
+makeLoopCatPlot <- function(loops, genomeObj, anchorSize = 2e3, loopTypes = c('CTCF', "MYC binding site", 'enhancer', 'TSS', "promoter"), saveFig = F){ # "H3K27Ac"
+  loopsGR <- GRanges(seqnames = loops$chr, ranges = IRanges(loops$anchor_X1, loops$anchor_X2), loopid = loops$id)
+  vpsGR <- genomeObj$vpsGR
+  loopPropotions <- list()
+  df <- data.frame(totalVPs = numeric(),
+                   loopVPs = numeric(),
+                   percentage = numeric(),
+                   looped = character(),
+                   type = character())
+  for(type in loopTypes){
+    loopedVPs <- sum(vpsGR$vpID[vpsGR$type == type]%in%loops$id)
+    totalVPs <- sum(vpsGR$type == type)
+    dfType1 <- data.frame(totalVPs = totalVPs,
+                          loopVPs = loopedVPs,
+                          percentage = loopedVPs/totalVPs,
+                          looped = 'yes',
+                          type = type)
+    dfType2 <- data.frame(totalVPs = totalVPs,
+                          loopVPs =  totalVPs - loopedVPs,
+                          percentage = (totalVPs - loopedVPs)/totalVPs,
+                          looped = 'no',
+
+                          type = type)
+
+    df <- rbind(dfType1,dfType2, df)
+  }
+
+  return(df)
+}
+
+mycBoundBarPlot <- function(loops, genomeObj, mycPeaks, promGR,type = 'TSS' ){
+  anchorGR <- GRanges(loops$chr, IRanges(start = loops$anchor_X1, end = loops$anchor_X2), id = loops$loopID)
+  ids <-  promGR$gene_id
+  loopedIDs <- promGR$gene_id[unique(findOverlaps(promGR, anchorGR)@from)]
+  df <- data.frame()
+  for(loop in c('yes', 'no')){
+    if(loop == 'yes'){
+      idSel <- loopedIDs
+      totalVP <- length(idSel)
+      bound <- findOverlaps(promGR[promGR$gene_id%in%idSel], mycPeaks, maxgap = 120)
+
+      mycBound <- length(unique(bound@from))
+      percentage <- mycBound/totalVP
+      kressCat1 <- table(promGR$KressCat[bound@from])
+      print(kressCat1)
+      df1 <- data.frame(totalVPs = totalVP,
+                        myc = mycBound,
+                        percentage = percentage,
+                        `MYC binding site` = 'yes',
+                        looped = loop,
+                        Myc_dep_DN = kressCat1[[1]]/sum(kressCat1),
+                        Myc_dep_UP = kressCat1[[2]]/sum(kressCat1),
+                        Myc_indep_DN = kressCat1[[3]]/sum(kressCat1),
+                        Myc_indep_UP = kressCat1[[4]]/sum(kressCat1),
+                        none = kressCat1[[5]]/sum(kressCat1)
+      )
+      mycUnbound <- promGR[!promGR$gene_id%in%promGR$gene_id[bound@from]]
+      kressCat2 <- table(mycUnbound$KressCat)
+      print(kressCat2)
+
+      df2 <- data.frame(totalVPs = totalVP,
+                        myc = totalVP- mycBound,
+                        percentage = 1-percentage,
+                        `MYC binding site` = 'no',
+                        looped = loop,
+                        Myc_dep_DN = kressCat2[[1]]/sum(kressCat2),
+                        Myc_dep_UP = kressCat2[[2]]/sum(kressCat2),
+                        Myc_indep_DN = kressCat2[[3]]/sum(kressCat2),
+                        Myc_indep_UP = kressCat2[[4]]/sum(kressCat2),
+                        none = kressCat2[[5]]/sum(kressCat2)
+      )
+      df <- rbind(df,df1,df2)
+    }else{
+      idSel <- ids[!ids%in%loopedIDs]
+      totalVP <- length(idSel)
+      bound <- findOverlaps(genomeObj$vpsGR[genomeObj$vpsGR$vpID%in%idSel], mycPeaks, maxgap = 120)
+      mycBound <- length(unique(bound@from))
+      percentage <- mycBound/totalVP
+      kressCat1 <-table(promGR$KressCat[bound@from])
+      df1 <- data.frame(totalVPs = totalVP,
+                        myc = mycBound,
+                        percentage = percentage,
+                        `MYC binding site` = 'yes',
+                        looped = loop,
+                        Myc_dep_DN = kressCat1[[1]]/sum(kressCat1),
+                        Myc_dep_UP = kressCat1[[2]]/sum(kressCat1),
+                        Myc_indep_DN = kressCat1[[3]]/sum(kressCat1),
+                        Myc_indep_UP = kressCat1[[4]]/sum(kressCat1),
+                        none = kressCat1[[5]]/sum(kressCat1)
+      )
+      mycUnbound <- promGR[!promGR$gene_id%in%promGR$gene_id[bound@from]]
+      kressCat2 <-table(mycUnbound$KressCat)
+      print(kressCat2)
+      df2 <- data.frame(totalVPs = totalVP,
+                        myc = totalVP- mycBound,
+                        percentage = 1-percentage,
+                        `MYC binding site` = 'no',
+                        looped = loop,
+                        Myc_dep_DN = kressCat2[[1]]/sum(kressCat2),
+                        Myc_dep_UP = kressCat2[[2]]/sum(kressCat2),
+                        Myc_indep_DN = kressCat2[[3]]/sum(kressCat2),
+                        Myc_indep_UP = kressCat2[[4]]/sum(kressCat2),
+                        none = kressCat2[[5]]/sum(kressCat2)
+      )
+      df <- rbind(df,df1,df2)
+
+    }
+
+  }
+  print(df)
+  df <- as.data.frame(df %>%
+                        select(-totalVPs, -myc) %>%
+                        pivot_longer(
+                          cols = (Myc_dep_DN:none),
+                          names_to = "Gene Category",
+                          values_to = "fraction"))
+  return(df)
+}
+
+getInteractionScoreFig2 <- function(loopIntCounts, control = c('S1', 'S2', 'S9'), tumor = c('S3', 'S4', 'S17'), sumVPs = F){
+  controlIS <- loopIntCounts[,'S1'] + loopIntCounts[,'S2'] + loopIntCounts[,'S9']
+  tumorIS <- loopIntCounts[,'S3'] + loopIntCounts[,'S4'] + loopIntCounts[,'S17']
+  loopIntCounts$controlIS <- controlIS
+  loopIntCounts$tumorIS <- tumorIS
+
+  loopIntCounts$controlCovQ <- rank(loopIntCounts$controlIS)/nrow(loopIntCounts)
+  loopIntCounts$tumorCovQ <- rank(loopIntCounts$tumorIS)/nrow(loopIntCounts)
+  loopIntCounts$CovQdiff <- loopIntCounts$controlCovQ - loopIntCounts$tumorCovQ
+  loopIntCounts <- loopIntCounts %>% arrange(controlIS) %>% filter(CovQdiff > quantile(CovQdiff, 0.025) & CovQdiff < quantile(CovQdiff, 0.975))
+
+  return(loopIntCounts)
+}
+
+evenbins <- function(x, bin.count=200, order=F) {
+  bin.size <- rep(length(x) %/% bin.count, bin.count)
+  bin.size <- bin.size + ifelse(1:bin.count <= length(x) %% bin.count, 1, 0)
+  bin <- rep(1:bin.count, bin.size)
+  if(order) {
+    bin <- bin[rank(x,ties.method="random")]
+  }
+  return(factor(bin, levels=1:bin.count, ordered=order))
+}
+
+removeOutliers <- function(n){
+  Q <- quantile(n, probs=c(.25, .75), na.rm = FALSE)
+
+  iqr <- IQR(n)
+
+  up <-  Q[2]+1.5*iqr # Upper Range
+  low <- Q[1]-1.5*iqr # Lower Range
+
+
+
+  return(n < up)
+  # return(n > 1 & n < (Q[2] + 1.5*iqr))
+}
+
+plotISwithExpression <- function(coverage, promGR,vpsGR,order = 'control', mycGR, mycDeSeq2){
+  ids <- vpsGR$vpID[vpsGR$type == 'enhancer']
+  coverage <- getInteractionScore(coverage)
+  anchorGR <- GRanges(coverage$chr, IRanges(coverage$anchor_X1, coverage$anchor_X2), id = coverage$loopID)
+  ovl <- findOverlaps(anchorGR, promGR)
+  coverage <- coverage[ovl@from,]
+  coverage$C_average <- promGR$C_average[ovl@to]
+  coverage$T_average <- promGR$T_average[ovl@to]
+  coverage$log2FC <- promGR$TvsC_log2FC[ovl@to]
+  coverage$KressCat <- promGR$KressCat[ovl@to]
+  coverage$anchorID <- promGR$gene_id[ovl@to]
+  coverage <- coverage[coverage$id%in%ids,]
+
+  anchorGR <- GRanges(coverage$chr, IRanges(coverage$anchor_X1, coverage$anchor_X2), id = coverage$loopID)
+  ovl <- as.data.frame(findOverlaps(anchorGR, mycDeSeq2, maxgap = 120))
+  ovl$mycFC <- mycDeSeq2$log2FoldChange[ovl$subjectHits]
+  ovl <- aggregate(ovl$mycFC, list(ovl$queryHits), mean)
+  coverage$mycFC <- NA
+  coverage$mycFC[ovl$Group.1] <- ovl$x
+
+  par(mfrow = c(3,1))
+  par(mar=c(0,4.5,0,7))
+
+  if(order == 'control'){
+    print(range(coverage$controlIS))
+    coverage <- coverage[removeOutliers(coverage$controlIS),]
+    print(range(coverage$controlIS))
+
+    anchorGR <- GRanges(coverage$chr, IRanges(coverage$anchor_X1, coverage$anchor_X2), id = coverage$loopID)
+    ovl <- as.data.frame(findOverlaps(anchorGR, mycGR, maxgap = 120))
+    ovl$myc <- mycGR$controlFC[ovl$subjectHits]
+    ovl <- aggregate(ovl$myc, list(ovl$queryHits), mean)
+    coverage$myc <- NA
+    coverage$myc[ovl$Group.1] <- ovl$x
+
+    coverage <- coverage[order(coverage$controlIS),]
+    coverage$bins <- evenbins(coverage$C_average)
+
+    medianVal <-  c()
+    medianValMyc <- c()
+    for(i in unique(coverage$bins)){
+      medianVal[i] <- median(coverage$C_average[coverage$bins == i], na.rm = T)
+      medianValMyc[i] <- median(coverage$myc[coverage$bins == i], na.rm = T)
+    }
+    plot(coverage$controlIS, type = "h",xaxs="i", yaxs="i",ylab = 'Interaction Strength', cex.lab = 1.5)
+  }else{
+    print(range(coverage$tumorIS))
+    coverage <- coverage[removeOutliers(coverage$tumorIS),]
+    print(range(coverage$tumorIS))
+
+    anchorGR <- GRanges(coverage$chr, IRanges(coverage$anchor_X1, coverage$anchor_X2), id = coverage$loopID)
+    ovl <- as.data.frame(findOverlaps(anchorGR, mycGR, maxgap = 120))
+    ovl$myc <- mycGR$tumorFC[ovl$subjectHits]
+    ovl <- aggregate(ovl$myc, list(ovl$queryHits), mean)
+    coverage$myc <- NA
+    coverage$myc[ovl$Group.1] <- ovl$x
+
+    coverage <- coverage[order(coverage$tumorIS),]
+    coverage$bins <- evenbins(coverage$T_average)
+
+    medianVal <-  c()
+    medianValMyc <- c()
+
+    for(i in unique(coverage$bins)){
+      medianVal[i] <- median(coverage$T_average[coverage$bins == i], na.rm = T)
+      medianValMyc[i] <- median(coverage$myc[coverage$bins == i], na.rm = T)
+
+    }
+    plot(coverage$tumorIS, type = "h",xaxs="i", yaxs="i", ylab = 'Interaction Strength', cex.lab = 1.5)
+  }
+
+  image(matrix(medianVal), col = heat.colors(100), ylab = 'RNA expression', axes = F, cex.lab = 1.5)
+  image.plot(matrix(seq(min(medianVal), max(medianVal), length.out = length(medianVal))), legend.only=T, col = heat.colors(100), smallplot = c(0.9, .95, .1, .9))
+  message(cor(medianVal, medianValMyc))
+  message(cor(coverage$T_average, coverage$myc, use = "complete.obs"))
+  image(matrix(medianValMyc), col = hcl.colors(100, palette = 'zissou 1'), ylab ='MYC Binding Intensity',axes = F, cex.lab = 1.5)
+  image.plot(matrix(seq(min(medianValMyc), max(medianValMyc), length.out = length(medianValMyc))), legend.only=T, col = hcl.colors(100, palette = 'zissou 1'), smallplot = c(0.9, .95, .1, .9))
+
+  return(coverage)
+}
+
+

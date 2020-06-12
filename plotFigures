@@ -1,0 +1,155 @@
+###########LOAD files etc############
+
+genomeObj <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/genomeObj.rds')
+vpID <- '159006175_CTCF'
+promNames <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/loop_calling_promoterGenes.rds')
+genesGR <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/mm9Genes.rds')
+rnaseq <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/tetMyc_rnaseqPromoters_Kress_et_al_data.rds')
+mycDat <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/mycDat.rds')
+bw_list <- list(myc = list(
+  bwMycControl = "/Users/Hidde/delaat/group/hidde/MODHEP/chipseq2/MACS2/myc_control_sorted.bw",
+  bwMycTumor = "/Users/Hidde/delaat/group/hidde/MODHEP/chipseq2/MACS2/myc_tumor_sorted.bw"),
+  H3K27 = list(
+    bwH3K27Control = '/Users/Hidde/delaat/group/hidde/MODHEP/chipseq2/MACS2/H3K27_control_sorted.bw',
+    bwH3K27Tumor = '/Users/Hidde/delaat/group/hidde/MODHEP/chipseq2/MACS2/H3K27_tumor_sorted.bw'),
+  CTCF = list(
+    CTCF_encode = '/Users/Hidde/delaat/group/hidde/MODHEP/chipseq2/MACS2/CTCF_encode.bw')
+)
+loops <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/recipLoops.rds')
+control <- c('S1', 'S2', 'S9')
+tumor <- c('S3', 'S4', 'S17')
+samples <- c(control,tumor)
+
+mycDatFilePath <- '/Users/Hidde/delaat/group/hidde/MODHEP/RData/mycDat'
+
+h3k27datFilePath <- '/Users/Hidde/delaat/group/hidde/MODHEP/RData/h3k27Dat'
+
+h3k27ControlFiles <- c('/home/hidde/MODHEP/chipseq2/H3K27ac/H3K27ac.C1.bam', '/home/hidde/MODHEP/chipseq2/H3K27ac/H3K27ac.C2.bam', '/home/hidde/MODHEP/chipseq2/H3K27ac/H3K27ac.C3.bam',
+                       '/home/hidde/MODHEP/chipseq2/H3K27ac/H3K27ac.C4.bam')
+
+h3k27TumorFiles <- c('/home/hidde/MODHEP/chipseq2/H3K27ac/H3K27ac.T1.bam', '/home/hidde/MODHEP/chipseq2/H3K27ac/H3K27ac.T2.bam', '/home/hidde/MODHEP/chipseq2/H3K27ac/H3K27ac.T3.bam',
+                     '/home/hidde/MODHEP/chipseq2/H3K27ac/H3K27ac.T4.bam')
+
+mycControlFiles <- c('/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/bamFiles/Myc.C1.bam', '/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/bamFiles/Myc.C2.bam', '/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/bamFiles/Myc.C3.bam',
+                     '/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/bamFiles/Myc.C4.bam')
+
+mycTumorFiles <- c('/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/bamFiles/Myc.T1.bam', '/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/bamFiles/Myc.T2.bam', '/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/bamFiles/Myc.T3.bam',
+                   '/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/bamFiles/Myc.T4.bam', '/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/bamFiles/Myc.T5.bam', '/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/bamFiles/Myc.T6.bam')
+
+mycOffFiles <- c("/home/hidde/MODHEP/chipseq2/Myc/Myc.Toff1.bam", "/home/hidde/MODHEP/chipseq2/Myc/Myc.Toff2.bam", "/home/hidde/MODHEP/chipseq2/Myc/Myc.Toff3.bam")
+
+h3k27OffFiles <- c('/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/bamFiles/H3K27ac.Toff1.bam', '/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/bamFiles/H3K27ac.Toff2.bam', '/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/bamFiles/H3K27ac.Toff3.bam')
+
+mycCounts <- readRDS("/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/mycVPcountsTvC.rds")
+h3k27Counts <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/chipseq/h3k27VPcountsTvC.rds')
+mycCounts$counts <- mycCounts$counts[,1:10]
+h3k27Counts$counts <- h3k27Counts$counts[,1:8]
+ABcompartments <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/ABcompartments_juicer_50kb_merged.rds')
+AtoB <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/AtoBcomp_juicer_50kb.rds')
+BtoA <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/BtoAcomp_juicer_50kb.rds')
+# loops <- fread('/Users/Hidde/delaat/group/hidde/MODHEP/loops/tet_Myc_GW_nReps_6_peakHiC_wSize_51_qWr_1.2_alphaFDR_0.05_loops.txt', sep = "\t", header = T, stringsAsFactors = F)
+# recipLoops <- getRecipPeaks(peakHiCObj =  genomeObj, loopDF = loops, anchorSize = 10e3, vpSize = 10e3)
+recipLoops <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/recipLoops.rds')
+recip <- loops$recipLoops
+# saveRDS(recipLoops, '/Users/Hidde/delaat/group/hidde/MODHEP/RData/recipLoops.rds')
+# rm(loops)
+coverage <- fread('/Users/Hidde/delaat/group/hidde/MODHEP/loops/tet_Myc_GW_nReps_6_peakHiC_wSize_51_qWr_1.2_alphaFDR_0.05_loopCov.txt', sep = "\t",
+                  stringsAsFactors = F, skip = 1, header = F, col.names = c(colnames(recip)[1:13], 'S1', "S2", "S3", 'S4', 'S9', 'S17'))
+recipCoverage <- coverage[coverage$loopID%in%recip$loopID,]
+smoothQuantile <- qsmooth(as.matrix(recipCoverage[,c('S1', 'S2','S3', 'S4', 'S9', 'S17')]), group_factor = c('control', 'control', 'tumor', 'tumor', "control", 'tumor'))
+
+recipCoverageNorm <-  as.data.frame(qsmoothData(smoothQuantile))
+# rm(coverage)
+enhancers <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/chromHMM_enhancers_ChIPSeq_Myc_CvsT.rds')
+
+mycTumorFE <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/chipseqSignalMycTumorPeaks.rds')
+
+mycControlFE <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/chipseqSignalMycControlPeaks.rds')
+
+rnaKress <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/tetMyc_rnaseq_2016_05_20.rds')
+rnaKress$type <- 'none'
+for(col in c( "Myc_indep_UP"  ,"Myc_dep_UP", "Myc_indep_DN",  "Myc_dep_DN")){
+  rnaKress$type[mcols(rnaKress)[[col]] == 'yes'] <- col
+}
+
+rnaProm <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/tetMyc_rnaseqPromoters_Kress_et_al_data.rds')
+###################
+# h3k27 <- getNormCounts(h3k27Counts$counts, filePath = h3k27datFilePath)
+
+# myc <- getNormCounts(mycCounts$counts, mycDatFilePath)
+
+mycAllFE <- c(mycTumorFE, mycControlFE)
+
+mycAllFE <- mycAllFE[mycAllFE$name%in%rownames(mycCounts$counts[!rowSums(mycCounts$counts) == 0,])]
+
+mycTumorFE <- mycTumorFE[mycTumorFE$name%in%rownames(mycCounts$counts[!rowSums(mycCounts$counts) == 0,])]
+
+recipCoverage <- recipCoverage %>% mutate(distance = abs(vp_X1 - maxV4CscorePos))
+
+loopCovTypes <- categoriseLoops(recipCoverage, genomeObj, removeOverlapping = F)
+
+h3k27 <- getNormCounts(h3k27Counts$counts, filePath = h3k27datFilePath)
+
+myc <- getNormCounts(mycCounts$counts, mycDatFilePath)
+
+rnaSeq <- readRDS('/Users/Hidde/delaat/group/hidde/MODHEP/RData/tetMyc_rnaseqPromoters_Kress_et_al_data.rds')
+rnaKress$type <- 'none'
+for(col in c( "Myc_indep_UP"  ,"Myc_dep_UP", "Myc_indep_DN",  "Myc_dep_DN")){
+  rnaKress$type[mcols(rnaKress)[[col]] == 'yes'] <- col
+}
+rnaSeq$KressCat <- rnaKress$type[match(rnaSeq$gene_id, rnaKress$gene)]
+
+################################
+#######FIGURE1##################
+z <- makeLoopCatPlot(recipLoops$recipLoops, genomeObj = genomeObj)
+y <- mycBoundBarPlot(recipLoops$recipLoops, genomeObj, mycPeaks, promGR = rnaSeq)
+colnames(y) <- c("percentage"    ,   "MYC binding site", "looped"       ,  "Gene Category"  ,  "fraction"   )
+y$`Gene Category` <- c('MYC depedent repressed', 'MYC depedent increased','MYC indepedent repressed','MYC indepedent increased', 'none' )
+
+p1 <- ggplot(z, aes(x = type, y = percentage * 100, fill = looped)) + geom_bar(stat = 'identity') + ggtitle('A') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ylab('percentage')
+p2 <- ggplot(y[c(1,6,11,16),], aes(x = looped, y = percentage  * 100, fill = `MYC binding site`)) + geom_bar(stat = 'identity') + ggtitle('B') + ylab('percentage')
+p3 <- ggplot(y[y$looped == 'yes',], aes(x = `MYC binding site`, y = fraction * 100, fill = `Gene Category`)) + geom_bar(stat = 'identity') + ggtitle('C') + xlab('MYC binding site') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ylab('percentage')
+p4 <- ggplot(y[y$looped == 'no',], aes(x = `MYC binding site`, y = fraction * 100, fill = `Gene Category`)) + geom_bar(stat = 'identity') + ggtitle('D')+ xlab('MYC binding site') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ylab('percentage')
+grid.arrange(p1,p2,p3,p4)
+png('/Users/Hidde/plotsMODHEP/fig1/peakHiCstats.png')
+grid.arrange(p1,p2,p3,p4)
+dev.off()
+
+################################
+#######FIGURE2##################
+
+png('/Users/Hidde/plotsMODHEP/fig4/RNAexpControl.png')
+z <- plotISwithExpressionFig2(recipCoverage, rnaSeq, vpsGR, order = 'control', mycGR = mycPeaks, mycDeSeq2 = myc$GR)
+dev.off()
+nrow(recipCoverage)
+
+nrow(coverage[coverage$id%in%recipCoverage$id, ])
+png('/Users/Hidde/plotsMODHEP/fig4/RNAexpTumor.png')
+z <- plotISwithExpressionFig2(recipCoverageNorm, rnaSeq, vpsGR, order = 'tumor', mycGR = mycPeaks, mycDeSeq2 = myc$GR)
+dev.off()
+
+################################
+#######FIGURE3&4################
+chMyc <- createMultipleHeatmap(genomeObj = genomeObj, leadingNormCounts = myc$sigNormCounts, leadingSigGR = myc$sigGR,
+                               loopCov = recipCoverage, heatmapObj = NULL, followingNormCounts = h3k27$normCounts,
+                               followingGR = h3k27$GR, expressionDat = rnaSeq, ABcompartments = ABcompartments)
+
+
+png('/delaat/group/hidde/mountVelo/heatmapMYCfinal.png')
+chMyc
+dev.off()
+#
+chH3K27 <- createMultipleHeatmap(genomeObj = genomeObj, leadingNormCounts = h3k27$sigNormCounts, loopCov = recipCoverage,
+                                 heatmapObj = NULL, followingNormCounts=myc$normCounts, followingGR = myc$GR,
+                                 expressionDat = rnaseq, leadingSigGR= h3k27$sigGR, ABcompartments = ABcompartments)
+
+png('/delaat/group/hidde/mountVelo/heatmapH3K27final.png')
+chH3K27
+dev.off()
+##############################
+#######FIGURE5################
+plotV4Cdata(vpID = vpID, genomeObj = genomeObj, bigwigs = bw_list, genesGR = genesGR, plot_genes = F, loops = loopsSel, recipPlot = F, saveFig = T, vpZoom = 1000000)
+
+##############################
+#######FIGURE6################
+
